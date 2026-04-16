@@ -2,6 +2,11 @@
   "name": "deepxiv-mac-client",
   "version": "1.0.0",
   "description": "DeepXiv macOS desktop client built with Electron and the official Python SDK",
+  "author": "wenjing-gg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wenjing-gg/DeepxivAPP.git"
+  },
   "main": "electron/main.js",
   "scripts": {
     "start": "npm run renderer:build && electron .",
@@ -10,9 +15,9 @@
     "renderer:dev": "vite --config renderer/vite.config.js",
     "renderer:build": "vite build --config renderer/vite.config.js",
     "build:mac": "npm run renderer:build && electron-builder --mac dir",
-    "dist:mac": "npm run renderer:build && electron-builder --mac zip",
+    "dist:mac": "npm run renderer:build && electron-builder --mac zip --publish never",
     "build:win": "npm run renderer:build && electron-builder --win dir",
-    "dist:win": "npm run renderer:build && electron-builder --win nsis zip"
+    "dist:win": "npm run renderer:build && electron-builder --win nsis zip --publish never"
   },
   "build": {
     "appId": "cn.rag.deepxiv.client",
