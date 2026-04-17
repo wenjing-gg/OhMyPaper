@@ -18,9 +18,11 @@ jobs:
           - os: macos-latest
             npm_script: dist:mac
             asset_glob: release/*.dmg
+            artifact_name: mac-release
           - os: windows-latest
             npm_script: dist:win
             asset_glob: release/*.exe
+            artifact_name: win-release
 
     runs-on: ${{ matrix.os }}
 
@@ -83,8 +85,36 @@ jobs:
       - name: Build release package
         run: npm run ${{ matrix.npm_script }}
 
-      - name: Upload release assets
+      - name: Upload packaged artifacts
         if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.asset_glob }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download mac artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-release
+          path: release-artifacts/mac
+
+      - name: Download windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: win-release
+          path: release-artifacts/win
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset_glob }}
+          files: |
+            release-artifacts/mac/*
+            release-artifacts/win/*
+          fail_on_unmatched_files: true
