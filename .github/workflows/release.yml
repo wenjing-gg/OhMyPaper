@@ -51,6 +51,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      - name: Smoke test Python bridge (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          export HOME="$RUNNER_TEMP/deepxiv-home"
+          mkdir -p "$HOME"
+          python python/bridge.py token-status '{}'
+          python python/bridge.py save-token '{"token":"ci-smoke-token"}'
+          python python/bridge.py token-status '{}'
+
       - name: Create Python venv (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -58,6 +69,16 @@ jobs:
           python -m venv .venv
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+      - name: Smoke test Python bridge (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\deepxiv-home" | Out-Null
+          $env:HOME = "$env:RUNNER_TEMP\deepxiv-home"
+          .\.venv\Scripts\python.exe python/bridge.py token-status '{}'
+          .\.venv\Scripts\python.exe python/bridge.py save-token '{"token":"ci-smoke-token"}'
+          .\.venv\Scripts\python.exe python/bridge.py token-status '{}'
 
       - name: Build release package
         run: npm run ${{ matrix.npm_script }}

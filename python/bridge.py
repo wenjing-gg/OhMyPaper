@@ -42,6 +42,10 @@ def current_token() -> Optional[str]:
     return get_token(None)
 
 
+def ensure_home_dir() -> None:
+    Path.home().mkdir(parents=True, exist_ok=True)
+
+
 def token_summary() -> Dict[str, Any]:
     token = current_token()
     masked = "未配置"
@@ -51,6 +55,7 @@ def token_summary() -> Dict[str, Any]:
 
 
 def register_token() -> Dict[str, Any]:
+    ensure_home_dir()
     token, daily_limit = auto_register_token()
     if not token:
         raise RuntimeError("匿名注册失败，请稍后重试")
@@ -63,6 +68,7 @@ def save_manual_token(token: str) -> Dict[str, Any]:
     token = token.strip()
     if not token:
         raise ValueError("请输入有效 Token")
+    ensure_home_dir()
     save_token(token, is_global=True)
     return token_summary()
 
