@@ -23,6 +23,23 @@ const AI_REASONING_LEVELS = new Set(['high', 'medium', 'low', 'minimal']);
 let mainWindow = null;
 const pdfViewerWindows = new Set();
 
+function defaultAiConfigStatus(aiConfig = normalizeAiConfig()) {
+  if (aiConfig.provider.requiresOpenAIAuth && !aiConfig.openAIApiKey) {
+    return {
+      ok: false,
+      code: 'missing_api_key',
+      message: '请先填写 OPENAI_API_KEY',
+      checkedAt: '',
+    };
+  }
+  return {
+    ok: false,
+    code: 'unverified',
+    message: '尚未验证 AI 连接',
+    checkedAt: '',
+  };
+}
+
 function appRoot() {
   if (process.env.DEEPXIV_PROJECT_ROOT) {
     return process.env.DEEPXIV_PROJECT_ROOT;
@@ -127,12 +144,24 @@ function normalizeAiConfig(raw = {}) {
   };
 }
 
+function normalizeAiConfigStatus(raw = {}, aiConfig = normalizeAiConfig()) {
+  const fallback = defaultAiConfigStatus(aiConfig);
+  return {
+    ok: raw.ok === true,
+    code: String(raw.code || fallback.code).trim() || fallback.code,
+    message: String(raw.message || (raw.ok === true ? `${aiConfig.provider.name} · ${aiConfig.model} 已通过连通性测试` : fallback.message)).trim() || fallback.message,
+    checkedAt: String(raw.checkedAt || '').trim(),
+  };
+}
+
 function defaultState() {
+  const aiConfig = normalizeAiConfig();
   return {
     favorites: {},
     favoriteGroups: defaultFavoriteGroupsMap(),
     history: [],
-    aiConfig: normalizeAiConfig(),
+    aiConfig,
+    aiConfigStatus: defaultAiConfigStatus(aiConfig),
   };
 }
 
@@ -445,6 +474,34 @@ async function parseJsonResponse(response) {
   }
 }
 
+function formatAiConnectivityError(baseUrl, error) {
+  const rawMessage = String(error?.message || '').trim();
+  const cause = error?.cause;
+  const causeCode = String(cause?.code || '').trim().toUpperCase();
+  let host = normalizeBaseUrl(baseUrl);
+  try {
+    host = new URL(baseUrl).host || host;
+  } catch (parseError) {
+  }
+
+  if (causeCode === 'ENOTFOUND') {
+    return `无法解析 AI 服务地址 ${host}`;
+  }
+  if (causeCode === 'ECONNRESET') {
+    return `AI 服务连接被重置，请检查 ${host} 是否可访问`;
+  }
+  if (causeCode === 'ECONNREFUSED') {
+    return `AI 服务拒绝连接：${host}`;
+  }
+  if (causeCode === 'ETIMEDOUT') {
+    return `连接 AI 服务超时：${host}`;
+  }
+  if (rawMessage === 'fetch failed' && host) {
+    return `无法连接到 AI 服务：${host}`;
+  }
+  return rawMessage || 'AI 请求失败';
+}
+
 async function findPython() {
   for (const candidate of pythonCandidates()) {
     try {
@@ -491,11 +548,13 @@ async function readState() {
     const content = await fsp.readFile(statePath(), 'utf-8');
     const payload = JSON.parse(content);
     const favoriteGroups = normalizeFavoriteGroupsMap(payload.favoriteGroups || {});
+    const aiConfig = normalizeAiConfig(payload.aiConfig || {});
     return {
       favorites: normalizeFavoritesMap(payload.favorites || {}, favoriteGroups),
       favoriteGroups,
       history: payload.history || [],
-      aiConfig: normalizeAiConfig(payload.aiConfig || {}),
+      aiConfig,
+      aiConfigStatus: normalizeAiConfigStatus(payload.aiConfigStatus || {}, aiConfig),
     };
   } catch (error) {
     return defaultState();
@@ -603,13 +662,106 @@ async function addHistory(kind, payload) {
 async function saveAiConfig(rawConfig) {
   const state = await readState();
   state.aiConfig = normalizeAiConfig(rawConfig || {});
+  state.aiConfigStatus = await probeAiConfig(state.aiConfig);
   await writeState(state);
-  return state.aiConfig;
+  return {
+    config: state.aiConfig,
+    status: state.aiConfigStatus,
+  };
 }
 
 async function getAiConfig() {
   const state = await readState();
   return state.aiConfig;
+}
+
+async function probeAiConfig(rawConfig = {}) {
+  const aiConfig = normalizeAiConfig(rawConfig || {});
+  const checkedAt = new Date().toISOString();
+
+  if (aiConfig.provider.wireApi !== 'responses') {
+    return normalizeAiConfigStatus({
+      ok: false,
+      code: 'unsupported_wire_api',
+      message: '当前仅支持 Responses 协议',
+      checkedAt,
+    }, aiConfig);
+  }
+
+  if (aiConfig.provider.requiresOpenAIAuth && !aiConfig.openAIApiKey) {
+    return normalizeAiConfigStatus({
+      ok: false,
+      code: 'missing_api_key',
+      message: '请先填写 OPENAI_API_KEY',
+      checkedAt,
+    }, aiConfig);
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+
+  try {
+    const response = await fetch(`${normalizeBaseUrl(aiConfig.provider.baseUrl)}/responses`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(aiConfig.provider.requiresOpenAIAuth ? { Authorization: `Bearer ${aiConfig.openAIApiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model: aiConfig.model,
+        store: false,
+        reasoning: { effort: 'minimal' },
+        instructions: 'Reply with OK only.',
+        input: [{ role: 'user', content: [{ type: 'input_text', text: 'ping' }] }],
+      }),
+      signal: controller.signal,
+    });
+    const data = await parseJsonResponse(response);
+    if (!response.ok) {
+      const message = data?.error?.message || data?.message || data?.rawText || `AI 请求失败（HTTP ${response.status}）`;
+      return normalizeAiConfigStatus({
+        ok: false,
+        code: `http_${response.status}`,
+        message,
+        checkedAt,
+      }, aiConfig);
+    }
+    return normalizeAiConfigStatus({
+      ok: true,
+      code: 'ok',
+      message: `${aiConfig.provider.name} · ${aiConfig.model} 已通过连通性测试`,
+      checkedAt,
+    }, aiConfig);
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      return normalizeAiConfigStatus({
+        ok: false,
+        code: 'timeout',
+        message: 'AI 连通性测试超时，请稍后重试',
+        checkedAt,
+      }, aiConfig);
+    }
+    return normalizeAiConfigStatus({
+      ok: false,
+      code: String(error?.cause?.code || 'network_error').trim().toLowerCase() || 'network_error',
+      message: formatAiConnectivityError(aiConfig.provider.baseUrl, error),
+      checkedAt,
+    }, aiConfig);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshStatus() {
+  const state = await readState();
+  const token = await callBridge('token-status');
+  state.aiConfigStatus = await probeAiConfig(state.aiConfig);
+  await writeState(state);
+  return {
+    token,
+    aiConfig: state.aiConfig,
+    aiConfigStatus: state.aiConfigStatus,
+  };
 }
 
 async function callAi(payload = {}) {
@@ -668,7 +820,7 @@ async function callAi(payload = {}) {
     if (error?.name === 'AbortError') {
       throw new Error('AI 请求超时，请稍后重试');
     }
-    throw new Error(error?.message || 'AI 请求失败');
+    throw new Error(formatAiConnectivityError(aiConfig.provider.baseUrl, error));
   } finally {
     clearTimeout(timer);
   }
@@ -802,6 +954,7 @@ async function bootstrap() {
     favoriteGroups: listFavoriteGroupsFromState(state),
     history: state.history,
     aiConfig: state.aiConfig,
+    aiConfigStatus: state.aiConfigStatus,
   };
 }
 
@@ -833,6 +986,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   ipcMain.handle('bootstrap', bootstrap);
+  ipcMain.handle('status:refresh', refreshStatus);
   ipcMain.handle('token:status', () => callBridge('token-status'));
   ipcMain.handle('token:save', (_, token) => callBridge('save-token', { token }));
   ipcMain.handle('token:register', () => callBridge('register-token'));

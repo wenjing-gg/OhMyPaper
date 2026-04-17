@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('deepxiv', {
   bootstrap: () => ipcRenderer.invoke('bootstrap'),
+  refreshStatus: () => ipcRenderer.invoke('status:refresh'),
   tokenStatus: () => ipcRenderer.invoke('token:status'),
   saveToken: (token) => ipcRenderer.invoke('token:save', token),
   registerToken: () => ipcRenderer.invoke('token:register'),

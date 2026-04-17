@@ -80,6 +80,23 @@ const DEFAULT_AI_CONFIG = {
   },
 };
 
+function defaultAiConfigStatus(aiConfig = normalizeAiConfig()) {
+  if (aiConfig.provider.requiresOpenAIAuth && !aiConfig.openAIApiKey) {
+    return {
+      ok: false,
+      code: 'missing_api_key',
+      message: '请先填写 OPENAI_API_KEY',
+      checkedAt: '',
+    };
+  }
+  return {
+    ok: false,
+    code: 'unverified',
+    message: '尚未验证 AI 连接',
+    checkedAt: '',
+  };
+}
+
 function normalizeAiConfig(raw) {
   const next = raw || {};
   const provider = next.provider || {};
@@ -96,6 +113,22 @@ function normalizeAiConfig(raw) {
       requiresOpenAIAuth: provider.requiresOpenAIAuth !== false,
     },
   };
+}
+
+function normalizeAiConfigStatus(raw, aiConfig = normalizeAiConfig()) {
+  const next = raw || {};
+  const fallback = defaultAiConfigStatus(aiConfig);
+  return {
+    ok: next.ok === true,
+    code: String(next.code || fallback.code).trim() || fallback.code,
+    message: String(next.message || (next.ok === true ? `${aiConfig.provider.name} · ${aiConfig.model} 已通过连通性测试` : fallback.message)).trim() || fallback.message,
+    checkedAt: String(next.checkedAt || '').trim(),
+  };
+}
+
+function toUserErrorMessage(error, fallback = '操作失败') {
+  const raw = String(error?.message || fallback).trim();
+  return raw.replace(/^Error invoking remote method '[^']+': Error: /, '').replace(/^Error: /, '').trim() || fallback;
 }
 
 function looksLikePdfUrl(url) {
@@ -430,7 +463,7 @@ function HistoryList({ items, activeKey, onSelect, emptyText }) {
   );
 }
 
-function AIChatPanel({ snapshot, paper, aiConfig, onAskAI }) {
+function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
   const [draft, setDraft] = useState('');
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -438,9 +471,13 @@ function AIChatPanel({ snapshot, paper, aiConfig, onAskAI }) {
   const paperContext = useMemo(() => buildAiPaperContext(snapshot, paper), [snapshot, paper, snapshotKey]);
   const needsAuth = aiConfig?.provider?.requiresOpenAIAuth !== false;
   const hasApiKey = Boolean(aiConfig?.openAIApiKey);
-  const ready = !needsAuth || hasApiKey;
+  const validated = !needsAuth || aiConfigStatus?.ok === true;
+  const ready = !needsAuth ? true : hasApiKey && validated;
   const hasTextContext = Boolean(paperContext.contextText);
   const hasPdfContext = Boolean(paperContext.pdfUrl);
+  const readinessHint = !hasApiKey
+    ? '请先在设置中填写 OPENAI_API_KEY'
+    : (aiConfigStatus?.message || '请先在设置页保存并验证 AI 配置');
   const contextStatus = hasPdfContext
     ? '已附带 PDF 原文上下文'
     : hasTextContext
@@ -468,7 +505,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, onAskAI }) {
         reasoningSummary: String(result.reasoningSummary || '').trim(),
       }]);
     } catch (error) {
-      setMessages((prev) => [...prev, { role: 'assistant', content: error?.message || 'AI 请求失败', isError: true }]);
+      setMessages((prev) => [...prev, { role: 'assistant', content: toUserErrorMessage(error, 'AI 请求失败'), isError: true }]);
     } finally {
       setLoading(false);
     }
@@ -486,7 +523,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, onAskAI }) {
       </div>
       <div className="ai-chat-context">
         <span className={`ai-context-chip ${hasPdfContext || hasTextContext ? 'ok' : 'warn'}`}>{contextStatus}</span>
-        {!ready && <span className="ai-context-chip warn">请先在设置中填写 OPENAI_API_KEY</span>}
+        {!ready && <span className="ai-context-chip warn">{readinessHint}</span>}
       </div>
       <div className="ai-chat-messages">
         {!messages.length && (
@@ -518,7 +555,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, onAskAI }) {
         <textarea
           className="ai-chat-input"
           value={draft}
-          placeholder={ready ? '输入你想问这篇论文的问题' : '请先在设置页配置 OPENAI_API_KEY'}
+          placeholder={ready ? '输入你想问这篇论文的问题' : readinessHint}
           disabled={!ready || loading}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
@@ -534,7 +571,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, onAskAI }) {
   );
 }
 
-function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite, onOpenPdf, loading, emptyText, aiConfig, onAskAI, embeddedPdf, onClosePdf }) {
+function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite, onOpenPdf, loading, emptyText, aiConfig, aiConfigStatus, onAskAI, embeddedPdf, onClosePdf }) {
   if (loading) return <EmptyState text="正在加载论文详情…" />;
   if (!snapshot) return <EmptyState text={emptyText} />;
 
@@ -574,7 +611,7 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
             <button className="btn" disabled={!openTarget} onClick={onOpenPdf}>{openLabel}</button>
           </div>
         </div>
-          <AIChatPanel snapshot={snapshot} paper={paper} aiConfig={aiConfig} onAskAI={onAskAI} />
+          <AIChatPanel snapshot={snapshot} paper={paper} aiConfig={aiConfig} aiConfigStatus={aiConfigStatus} onAskAI={onAskAI} />
         </div>
       </div>
 
@@ -606,6 +643,7 @@ export default function App() {
   const [activeHistoryKey, setActiveHistoryKey] = useState('');
   const [tokenInput, setTokenInput] = useState('');
   const [aiConfig, setAiConfig] = useState(normalizeAiConfig());
+  const [aiConfigStatus, setAiConfigStatus] = useState(defaultAiConfigStatus(normalizeAiConfig()));
   const [aiConfigForm, setAiConfigForm] = useState(normalizeAiConfig());
 
   const pageMeta = PAGE_META[page];
@@ -636,9 +674,6 @@ export default function App() {
   const searchActionLabel = showSearchLimit ? '搜索' : '打开';
   const tokenIndicator = token?.has_token ? '✓' : '✕';
   const tokenIndicatorClass = token?.has_token ? 'success' : 'error';
-  const aiIndicator = (!aiConfig?.provider?.requiresOpenAIAuth || aiConfig?.openAIApiKey) ? '✓' : '✕';
-  const aiIndicatorClass = (!aiConfig?.provider?.requiresOpenAIAuth || aiConfig?.openAIApiKey) ? 'success' : 'error';
-
   async function refreshBootstrap() {
     const bootstrap = await window.deepxiv.bootstrap();
     setToken(bootstrap.token);
@@ -647,9 +682,28 @@ export default function App() {
     setHistory(bootstrap.history || []);
     const nextAiConfig = normalizeAiConfig(bootstrap.aiConfig || {});
     setAiConfig(nextAiConfig);
+    setAiConfigStatus(normalizeAiConfigStatus(bootstrap.aiConfigStatus, nextAiConfig));
     setAiConfigForm(nextAiConfig);
     if (bootstrap.token?.token) {
       setTokenInput(bootstrap.token.token);
+    }
+  }
+
+  async function handleRefreshStatus() {
+    setStatusText('正在刷新状态…');
+    try {
+      const result = await window.deepxiv.refreshStatus();
+      setToken(result.token || null);
+      const nextAiConfig = normalizeAiConfig(result.aiConfig || aiConfig);
+      setAiConfig(nextAiConfig);
+      setAiConfigForm(nextAiConfig);
+      setAiConfigStatus(normalizeAiConfigStatus(result.aiConfigStatus, nextAiConfig));
+      if (result.token?.token) {
+        setTokenInput(result.token.token);
+      }
+      setStatusText('状态已刷新');
+    } catch (error) {
+      setStatusText(toUserErrorMessage(error, '刷新状态失败'));
     }
   }
 
@@ -705,7 +759,7 @@ export default function App() {
       }
     } catch (error) {
       setSnapshots((prev) => ({ ...prev, [context]: null }));
-      setStatusText(error?.message || '加载详情失败');
+      setStatusText(toUserErrorMessage(error, '加载详情失败'));
     } finally {
       setLoadingDetail((prev) => ({ ...prev, [context]: false }));
       setStatusText('');
@@ -731,7 +785,7 @@ export default function App() {
       setSearchResults([]);
       setSnapshots((prev) => ({ ...prev, search: null }));
       setActivePaper((prev) => ({ ...prev, search: null }));
-      setStatusText(error?.message || '搜索失败');
+      setStatusText(toUserErrorMessage(error, '搜索失败'));
     }
   }
 
@@ -770,7 +824,7 @@ export default function App() {
         await openPaper('library', normalizePaper(result.imported));
       }
     } catch (error) {
-      setStatusText(error?.message || '导入本地 PDF 失败');
+      setStatusText(toUserErrorMessage(error, '导入本地 PDF 失败'));
     }
   }
 
@@ -833,8 +887,9 @@ export default function App() {
     try {
       const nextToken = await window.deepxiv.saveToken(tokenInput);
       setToken(nextToken);
-    } finally {
-      setStatusText('');
+      setStatusText('Token 已保存');
+    } catch (error) {
+      setStatusText(toUserErrorMessage(error, '保存 Token 失败'));
     }
   }
 
@@ -844,8 +899,9 @@ export default function App() {
       const nextToken = await window.deepxiv.registerToken();
       setToken(nextToken);
       setTokenInput(nextToken.token || '');
-    } finally {
-      setStatusText('');
+      setStatusText('匿名注册成功');
+    } catch (error) {
+      setStatusText(toUserErrorMessage(error, '匿名注册失败'));
     }
   }
 
@@ -853,11 +909,14 @@ export default function App() {
     setStatusText('正在保存 AI 配置…');
     try {
       const saved = await window.deepxiv.saveAiConfig(aiConfigForm);
-      const normalized = normalizeAiConfig(saved || {});
+      const normalized = normalizeAiConfig(saved?.config || {});
+      const nextStatus = normalizeAiConfigStatus(saved?.status, normalized);
       setAiConfig(normalized);
       setAiConfigForm(normalized);
-    } finally {
-      setStatusText('');
+      setAiConfigStatus(nextStatus);
+      setStatusText(nextStatus.ok ? 'AI 配置已保存并验证通过' : `AI 配置已保存，但当前不可用：${nextStatus.message}`);
+    } catch (error) {
+      setStatusText(toUserErrorMessage(error, '保存 AI 配置失败'));
     }
   }
 
@@ -892,6 +951,8 @@ export default function App() {
     setStatusText('AI 正在结合论文上下文思考…');
     try {
       return await window.deepxiv.aiChat(payload);
+    } catch (error) {
+      throw new Error(toUserErrorMessage(error, 'AI 请求失败'));
     } finally {
       setStatusText('');
     }
@@ -930,8 +991,14 @@ export default function App() {
 
   const tokenStatusLabel = token?.has_token ? '已就绪' : '未配置';
   const tokenStatusHint = token?.has_token ? (token?.daily_limit ? `每日额度 ${token.daily_limit}` : '可立即搜索与阅读') : '请先保存或匿名注册 Token';
-  const aiStatusLabel = (!aiConfig?.provider?.requiresOpenAIAuth || aiConfig?.openAIApiKey) ? 'AI 已就绪' : 'AI 未配置';
-  const aiStatusHint = (!aiConfig?.provider?.requiresOpenAIAuth || aiConfig?.openAIApiKey) ? `${aiConfig.provider.name} · ${aiConfig.model}` : '请先填写 OPENAI_API_KEY';
+  const aiStatusLabel = aiConfigStatus?.ok
+    ? 'AI 已就绪'
+    : (aiConfig?.provider?.requiresOpenAIAuth && !aiConfig?.openAIApiKey ? 'AI 未配置' : 'AI 不可用');
+  const aiStatusHint = aiConfigStatus?.ok
+    ? (aiConfigStatus?.message || `${aiConfig.provider.name} · ${aiConfig.model}`)
+    : (aiConfigStatus?.message || '请先填写 OPENAI_API_KEY');
+  const aiIndicator = aiConfigStatus?.ok ? '✓' : '✕';
+  const aiIndicatorClass = aiConfigStatus?.ok ? 'success' : 'error';
 
   return (
     <div className="app-shell">
@@ -1006,6 +1073,7 @@ export default function App() {
                   loading={loadingDetail.search}
                   emptyText="请选择一篇论文。"
                   aiConfig={aiConfig}
+                  aiConfigStatus={aiConfigStatus}
                   onAskAI={handleAskAI}
                   embeddedPdf={embeddedPdf.search}
                   onClosePdf={() => closeEmbeddedPdf('search')}
@@ -1122,6 +1190,7 @@ export default function App() {
                   loading={loadingDetail.library}
                   emptyText="请选择一篇收藏论文。"
                   aiConfig={aiConfig}
+                  aiConfigStatus={aiConfigStatus}
                   onAskAI={handleAskAI}
                   embeddedPdf={embeddedPdf.library}
                   onClosePdf={() => closeEmbeddedPdf('library')}
@@ -1148,6 +1217,7 @@ export default function App() {
                   loading={loadingDetail.history}
                   emptyText="请选择一篇最近访问的论文。"
                   aiConfig={aiConfig}
+                  aiConfigStatus={aiConfigStatus}
                   onAskAI={handleAskAI}
                   embeddedPdf={embeddedPdf.history}
                   onClosePdf={() => closeEmbeddedPdf('history')}
@@ -1173,7 +1243,7 @@ export default function App() {
                 <div className="btn-row">
                   <button className="btn" onClick={handleSaveToken}>保存</button>
                   <button className="btn primary" onClick={handleRegisterToken}>匿名注册</button>
-                  <button className="btn" onClick={refreshBootstrap}>刷新状态</button>
+                  <button className="btn" onClick={handleRefreshStatus}>刷新状态</button>
                 </div>
               </div>
 
