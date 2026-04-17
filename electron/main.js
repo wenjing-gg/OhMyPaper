@@ -77,6 +77,14 @@ function bridgePath() {
   return path.join(appRoot(), 'python', 'bridge.py');
 }
 
+function bridgeEnv() {
+  return {
+    ...process.env,
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+  };
+}
+
 async function findBundledBridge() {
   for (const candidate of bundledBridgeCandidates()) {
     try {
@@ -564,7 +572,7 @@ async function callBridge(command, payload = {}) {
     : [bridgePath(), command, JSON.stringify(payload)];
 
   return new Promise((resolve, reject) => {
-    execFile(executable, args, { cwd: appRoot(), timeout: 120000 }, (error, stdout, stderr) => {
+    execFile(executable, args, { cwd: appRoot(), env: bridgeEnv(), timeout: 120000 }, (error, stdout, stderr) => {
       const trimmed = String(stdout || '').trim();
       const lines = trimmed ? trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
       const candidate = lines.length ? lines[lines.length - 1] : trimmed;

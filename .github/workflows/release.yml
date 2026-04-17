@@ -79,6 +79,12 @@ jobs:
           ./bridge-dist/deepxiv-bridge save-token '{"token":"ci-bundled-token"}'
           ./bridge-dist/deepxiv-bridge token-status '{}'
 
+      - name: Smoke test bridge Unicode output (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          LC_ALL=C PYTHONIOENCODING=ascii .venv/bin/python python/bridge.py import-local-pdf '{"path":"/tmp/论文-ö-missing.pdf"}' || true
+
       - name: Create Python venv (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -111,6 +117,14 @@ jobs:
           .\bridge-dist\deepxiv-bridge.exe token-status '{}'
           .\bridge-dist\deepxiv-bridge.exe save-token '{"token":"ci-bundled-token"}'
           .\bridge-dist\deepxiv-bridge.exe token-status '{}'
+
+      - name: Smoke test bridge Unicode output (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PYTHONIOENCODING = 'ascii'
+          .\.venv\Scripts\python.exe python/bridge.py import-local-pdf '{"path":"C:\\temp\\论文-ö-missing.pdf"}' | ConvertFrom-Json | Out-Null
+          .\bridge-dist\deepxiv-bridge.exe import-local-pdf '{"path":"C:\\temp\\论文-ö-missing.pdf"}' | ConvertFrom-Json | Out-Null
 
       - name: Build release package
         run: npm run ${{ matrix.npm_script }}

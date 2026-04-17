@@ -36,6 +36,23 @@ SOURCE_PRIORITY = {
 }
 
 
+def configure_stdio_encoding() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if not stream:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not reconfigure:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
+
+configure_stdio_encoding()
+
+
 def load_env() -> None:
     load_dotenv(Path.home() / ".env", override=False)
     load_dotenv(Path.cwd() / ".env", override=False)
@@ -1308,11 +1325,23 @@ COMMANDS = {
 
 
 def emit_ok(data: Any) -> None:
-    print(json.dumps({"ok": True, "data": data}, ensure_ascii=False))
+    emit_json({"ok": True, "data": data})
 
 
 def emit_error(message: str) -> None:
-    print(json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+    emit_json({"ok": False, "error": str(message)})
+
+
+def emit_json(payload: Dict[str, Any]) -> None:
+    text = json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n"
+    data = text.encode("ascii", errors="backslashreplace")
+    stdout_buffer = getattr(sys.stdout, "buffer", None)
+    if stdout_buffer:
+        stdout_buffer.write(data)
+        stdout_buffer.flush()
+        return
+    sys.stdout.write(data.decode("ascii", errors="replace"))
+    sys.stdout.flush()
 
 
 def main() -> int:
