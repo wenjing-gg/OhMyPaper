@@ -83,7 +83,9 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          LC_ALL=C PYTHONIOENCODING=ascii .venv/bin/python python/bridge.py import-local-pdf '{"path":"/tmp/论文-ö-missing.pdf"}' || true
+          TOKEN='unicode-ö-token'
+          LC_ALL=C PYTHONIOENCODING=ascii .venv/bin/python python/bridge.py save-token "{\"token\":\"${TOKEN}\"}" | python -c 'import json,sys; json.load(sys.stdin)'
+          LC_ALL=C PYTHONIOENCODING=ascii .venv/bin/python python/bridge.py token-status '{}' | python -c 'import json,sys; json.load(sys.stdin)'
 
       - name: Create Python venv (Windows)
         if: runner.os == 'Windows'
@@ -122,9 +124,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $token = "unicode-$([char]0x00F6)-token"
           $env:PYTHONIOENCODING = 'ascii'
-          .\.venv\Scripts\python.exe python/bridge.py import-local-pdf '{"path":"C:\\temp\\论文-ö-missing.pdf"}' | ConvertFrom-Json | Out-Null
-          .\bridge-dist\deepxiv-bridge.exe import-local-pdf '{"path":"C:\\temp\\论文-ö-missing.pdf"}' | ConvertFrom-Json | Out-Null
+          .\.venv\Scripts\python.exe python/bridge.py "save-token" ("{\"token\":\"" + $token + "\"}") | ConvertFrom-Json | Out-Null
+          .\.venv\Scripts\python.exe python/bridge.py token-status '{}' | ConvertFrom-Json | Out-Null
+          .\bridge-dist\deepxiv-bridge.exe "save-token" ("{\"token\":\"" + $token + "\"}") | ConvertFrom-Json | Out-Null
+          .\bridge-dist\deepxiv-bridge.exe token-status '{}' | ConvertFrom-Json | Out-Null
 
       - name: Build release package
         run: npm run ${{ matrix.npm_script }}
