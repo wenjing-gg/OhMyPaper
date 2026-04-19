@@ -6,7 +6,7 @@ import socket
 import ssl
 import struct
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
@@ -297,7 +297,13 @@ def parse_publish_time(value: Any) -> float:
         return 0.0
     for candidate in (text, text.replace("Z", "+00:00"), f"{text}-01-01"):
         try:
-            return datetime.fromisoformat(candidate).timestamp()
+            parsed = datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            return (parsed - epoch).total_seconds()
         except ValueError:
             continue
     return 0.0
