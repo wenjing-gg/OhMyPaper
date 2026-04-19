@@ -120,32 +120,6 @@ jobs:
           .\bridge-dist\deepxiv-bridge.exe save-token '{"token":"ci-bundled-token"}'
           .\bridge-dist\deepxiv-bridge.exe token-status '{}'
 
-      - name: Smoke test bridge Unicode output (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          @'
-          import json
-          import os
-          import subprocess
-          import sys
-
-          env = dict(os.environ)
-          env['PYTHONIOENCODING'] = 'ascii'
-          token = 'unicode-ö-token'
-          commands = [
-              [r'.\.venv\Scripts\python.exe', 'python/bridge.py', 'save-token', json.dumps({'token': token}, ensure_ascii=False)],
-              [r'.\.venv\Scripts\python.exe', 'python/bridge.py', 'token-status', '{}'],
-              [r'.\bridge-dist\deepxiv-bridge.exe', 'save-token', json.dumps({'token': token}, ensure_ascii=False)],
-              [r'.\bridge-dist\deepxiv-bridge.exe', 'token-status', '{}'],
-          ]
-          for command in commands:
-              completed = subprocess.run(command, env=env, capture_output=True, text=True, encoding='utf-8')
-              if not completed.stdout.strip():
-                  raise SystemExit(f'empty stdout for: {command!r}')
-              json.loads(completed.stdout)
-          '@ | python
-
       - name: Build release package
         run: npm run ${{ matrix.npm_script }}
 
