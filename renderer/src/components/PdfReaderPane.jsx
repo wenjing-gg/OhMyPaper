@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist';
-import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import workerSrc from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 
 GlobalWorkerOptions.workerSrc = workerSrc;
 
@@ -37,19 +37,107 @@ async function destroyLoadingTask(task) {
   }
 }
 
-export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocument }) {
+function PdfPageCanvas({ pdfDocument, pageNumber, scale, estimatedHeight }) {
   const canvasRef = useRef(null);
-  const stageRef = useRef(null);
   const renderTaskRef = useRef(null);
+  const [pageState, setPageState] = useState({ rendered: false, error: '', width: 0, height: 0 });
+
+  useEffect(() => {
+    if (!pdfDocument || !canvasRef.current) return undefined;
+
+    let cancelled = false;
+    let pageProxy = null;
+
+    setPageState((prev) => ({ ...prev, rendered: false, error: '' }));
+
+    (async () => {
+      const page = await pdfDocument.getPage(pageNumber);
+      pageProxy = page;
+      if (cancelled) return;
+
+      const viewport = page.getViewport({ scale });
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const pixelRatio = window.devicePixelRatio || 1;
+      canvas.width = Math.ceil(viewport.width * pixelRatio);
+      canvas.height = Math.ceil(viewport.height * pixelRatio);
+      canvas.style.width = `${Math.ceil(viewport.width)}px`;
+      canvas.style.height = `${Math.ceil(viewport.height)}px`;
+
+      const context = canvas.getContext('2d', { alpha: false });
+      if (!context) {
+        throw new Error('无法初始化 PDF 画布');
+      }
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, viewport.width, viewport.height);
+
+      renderTaskRef.current?.cancel?.();
+      const renderTask = page.render({ canvasContext: context, viewport });
+      renderTaskRef.current = renderTask;
+
+      setPageState({
+        rendered: false,
+        error: '',
+        width: viewport.width,
+        height: viewport.height,
+      });
+
+      await renderTask.promise;
+      if (cancelled) return;
+
+      setPageState({
+        rendered: true,
+        error: '',
+        width: viewport.width,
+        height: viewport.height,
+      });
+    })().catch((error) => {
+      if (cancelled || error?.name === 'RenderingCancelledException') return;
+      setPageState((prev) => ({
+        ...prev,
+        rendered: false,
+        error: String(error?.message || error || 'PDF 渲染失败').trim() || 'PDF 渲染失败',
+      }));
+    });
+
+    return () => {
+      cancelled = true;
+      renderTaskRef.current?.cancel?.();
+      pageProxy?.cleanup?.();
+    };
+  }, [pdfDocument, pageNumber, scale]);
+
+  const shellStyle = pageState.height > 0
+    ? { minHeight: `${Math.ceil(pageState.height)}px` }
+    : { minHeight: `${Math.max(estimatedHeight, 280)}px` };
+
+  return (
+    <div className={`embedded-pdf-page ${pageState.error ? 'error' : ''}`.trim()}>
+      <div className="embedded-pdf-page-meta">第 {pageNumber} 页</div>
+      <div className="embedded-pdf-page-shell" style={shellStyle}>
+        {pageState.error ? (
+          <div className="embedded-pdf-page-error">{pageState.error}</div>
+        ) : (
+          <>
+            <canvas ref={canvasRef} className="embedded-pdf-canvas" />
+            {!pageState.rendered && <div className="embedded-pdf-page-placeholder">正在渲染第 {pageNumber} 页…</div>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocument }) {
+  const stageRef = useRef(null);
   const [pdfDocument, setPdfDocument] = useState(null);
   const [pageCount, setPageCount] = useState(0);
-  const [pageNumber, setPageNumber] = useState(1);
   const [zoomMode, setZoomMode] = useState('fit-width');
   const [customScale, setCustomScale] = useState(1);
   const [containerWidth, setContainerWidth] = useState(0);
   const [baseViewport, setBaseViewport] = useState(null);
   const [loadState, setLoadState] = useState({ loading: false, error: '', message: '' });
-  const [rendering, setRendering] = useState(false);
 
   const pdfStatusText = useMemo(() => {
     if (!pdfStatus) return '';
@@ -78,6 +166,10 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
   }, [viewer?.paperKey]);
 
   useEffect(() => {
+    stageRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+  }, [viewer?.paperKey]);
+
+  useEffect(() => {
     if (!viewer?.payload && !viewer?.target) {
       setPdfDocument(null);
       setPageCount(0);
@@ -93,7 +185,6 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
     setLoadState({ loading: true, error: '', message: '正在加载 PDF…' });
     setPdfDocument(null);
     setPageCount(0);
-    setPageNumber(1);
     setBaseViewport(null);
     setZoomMode('fit-width');
     setCustomScale(1);
@@ -118,6 +209,11 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
         return;
       }
 
+      const firstPage = await activeDocument.getPage(1);
+      const firstViewport = firstPage.getViewport({ scale: 1 });
+      firstPage.cleanup?.();
+
+      setBaseViewport(firstViewport);
       setPdfDocument(activeDocument);
       setPageCount(activeDocument.numPages || 0);
       setLoadState({ loading: false, error: '', message: '' });
@@ -136,7 +232,6 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
 
     return () => {
       cancelled = true;
-      renderTaskRef.current?.cancel?.();
       void destroyLoadingTask(loadingTask);
       if (activeDocument) {
         activeDocument.destroy().catch(() => {});
@@ -146,75 +241,23 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
 
   const fitWidthScale = useMemo(() => {
     if (!baseViewport?.width || !containerWidth) return 1;
-    return clamp((containerWidth - 40) / baseViewport.width, 0.4, 3.5);
+    return clamp((containerWidth - 48) / baseViewport.width, 0.4, 3.5);
   }, [baseViewport, containerWidth]);
 
   const actualScale = useMemo(() => {
     return zoomMode === 'fit-width' ? fitWidthScale : clamp(customScale, 0.4, 3.5);
   }, [zoomMode, fitWidthScale, customScale]);
 
-  useEffect(() => {
-    if (!pdfDocument || !pageNumber || !canvasRef.current) return undefined;
+  const estimatedHeight = useMemo(() => {
+    if (!baseViewport?.height || !baseViewport?.width) return 520;
+    const ratio = baseViewport.height / baseViewport.width;
+    const estimatedWidth = Math.max(320, (baseViewport.width || 1) * actualScale);
+    return Math.round(estimatedWidth * ratio);
+  }, [actualScale, baseViewport]);
 
-    let cancelled = false;
-    let pageProxy = null;
-
-    const renderPage = async () => {
-      setRendering(true);
-      const page = await pdfDocument.getPage(pageNumber);
-      pageProxy = page;
-      if (cancelled) return;
-
-      const nextBaseViewport = page.getViewport({ scale: 1 });
-      setBaseViewport((prev) => {
-        if (!prev || prev.width !== nextBaseViewport.width || prev.height !== nextBaseViewport.height) {
-          return nextBaseViewport;
-        }
-        return prev;
-      });
-
-      const viewport = page.getViewport({ scale: actualScale });
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      const pixelRatio = window.devicePixelRatio || 1;
-      canvas.width = Math.ceil(viewport.width * pixelRatio);
-      canvas.height = Math.ceil(viewport.height * pixelRatio);
-      canvas.style.width = `${Math.ceil(viewport.width)}px`;
-      canvas.style.height = `${Math.ceil(viewport.height)}px`;
-
-      const context = canvas.getContext('2d', { alpha: false });
-      if (!context) {
-        throw new Error('无法初始化 PDF 画布');
-      }
-      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-      context.clearRect(0, 0, viewport.width, viewport.height);
-
-      renderTaskRef.current?.cancel?.();
-      const renderTask = page.render({ canvasContext: context, viewport });
-      renderTaskRef.current = renderTask;
-      await renderTask.promise;
-      if (!cancelled) {
-        setRendering(false);
-      }
-    };
-
-    renderPage().catch((error) => {
-      if (cancelled || error?.name === 'RenderingCancelledException') return;
-      setLoadState({
-        loading: false,
-        error: String(error?.message || error || 'PDF 渲染失败').trim() || 'PDF 渲染失败',
-        message: '',
-      });
-      setRendering(false);
-    });
-
-    return () => {
-      cancelled = true;
-      renderTaskRef.current?.cancel?.();
-      pageProxy?.cleanup?.();
-    };
-  }, [pdfDocument, pageNumber, actualScale]);
+  const pageNumbers = useMemo(() => {
+    return Array.from({ length: pageCount }, (_, index) => index + 1);
+  }, [pageCount]);
 
   const adjustZoom = useCallback((delta) => {
     setZoomMode('custom');
@@ -244,9 +287,7 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
           {!pdfStatusText && loadState.message && <div className="embedded-pdf-status">{loadState.message}</div>}
         </div>
         <div className="embedded-pdf-actions embedded-pdf-actions-wide">
-          <button className="mini-btn" onClick={() => setPageNumber((prev) => Math.max(1, prev - 1))} disabled={!pageCount || pageNumber <= 1}>上一页</button>
-          <div className="embedded-pdf-counter">{pageCount ? `${pageNumber} / ${pageCount}` : '-- / --'}</div>
-          <button className="mini-btn" onClick={() => setPageNumber((prev) => Math.min(pageCount || 1, prev + 1))} disabled={!pageCount || pageNumber >= pageCount}>下一页</button>
+          <div className="embedded-pdf-counter">{pageCount ? `共 ${pageCount} 页` : '-- 页'}</div>
           <button className="mini-btn" onClick={() => adjustZoom(-0.12)} disabled={!pdfDocument}>－</button>
           <button className={`mini-btn ${zoomMode === 'fit-width' ? 'active' : ''}`.trim()} onClick={() => setZoomMode('fit-width')} disabled={!pdfDocument}>适宽</button>
           <button className={`mini-btn ${zoomMode === 'custom' && Math.abs(actualScale - 1) < 0.01 ? 'active' : ''}`.trim()} onClick={() => {
@@ -255,6 +296,7 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
           }} disabled={!pdfDocument}>100%</button>
           <div className="embedded-pdf-scale">{formatScaleLabel(actualScale)}</div>
           <button className="mini-btn" onClick={() => adjustZoom(0.12)} disabled={!pdfDocument}>＋</button>
+          <button className="mini-btn" onClick={() => stageRef.current?.scrollTo({ top: 0, behavior: 'smooth' })} disabled={!pdfDocument}>回到顶部</button>
           <button className="mini-btn" onClick={onClose}>关闭 PDF</button>
         </div>
       </div>
@@ -272,9 +314,16 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
         ) : !pdfDocument ? (
           <div className="embedded-pdf-empty">暂无 PDF 内容</div>
         ) : (
-          <div className="embedded-pdf-canvas-wrap">
-            <canvas ref={canvasRef} className="embedded-pdf-canvas" />
-            {rendering && <div className="embedded-pdf-rendering">正在渲染页面…</div>}
+          <div className="embedded-pdf-pages">
+            {pageNumbers.map((pageNumber) => (
+              <PdfPageCanvas
+                key={`${viewer?.paperKey || viewer?.target || 'pdf'}-${pageNumber}`}
+                pdfDocument={pdfDocument}
+                pageNumber={pageNumber}
+                scale={actualScale}
+                estimatedHeight={estimatedHeight}
+              />
+            ))}
           </div>
         )}
       </div>

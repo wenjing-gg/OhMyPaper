@@ -597,22 +597,17 @@ async function ensurePdfReadyForRead(normalized) {
   if (cachedStatus?.state === 'ready' && cachedStatus.openTarget && !isRemoteHttpUrl(cachedStatus.openTarget)) {
     return cachedStatus;
   }
-
-  if (normalized.sourceUrl && looksLikePdfUrl(normalized.sourceUrl)) {
-    if (!pdfPrefetchTasks.get(normalized.paperKey)) {
-      await startPdfPrefetch(normalized);
-    }
-    const task = pdfPrefetchTasks.get(normalized.paperKey);
-    if (task) {
-      await task.catch(() => {});
-    }
-    const readyStatus = await getCachedPdfStatus(normalized);
-    if (readyStatus?.state === 'ready') {
-      return readyStatus;
-    }
-  }
-
   return cachedStatus;
+}
+
+function prefetchPdfInBackground(normalized) {
+  if (!normalized?.paperKey || !normalized?.sourceUrl || !looksLikePdfUrl(normalized.sourceUrl)) {
+    return;
+  }
+  if (pdfPrefetchTasks.get(normalized.paperKey)) {
+    return;
+  }
+  startPdfPrefetch(normalized).catch(() => {});
 }
 
 async function loadPdfDocument(payload = {}) {
@@ -622,14 +617,9 @@ async function loadPdfDocument(payload = {}) {
   }
 
   const readyStatus = await ensurePdfReadyForRead(normalized);
-  const openTarget = String(
-    readyStatus?.cachedPath
-    || readyStatus?.openTarget
-    || normalized.localPath
-    || normalized.sourceUrl
-    || normalized.target
-    || ''
-  ).trim();
+  const readyLocalTarget = String(readyStatus?.cachedPath || readyStatus?.openTarget || normalized.localPath || '').trim();
+  const remoteTarget = String(normalized.sourceUrl || normalized.target || '').trim();
+  const openTarget = readyLocalTarget || remoteTarget;
 
   if (!openTarget) {
     throw new Error('未找到可打开的 PDF');
@@ -644,6 +634,7 @@ async function loadPdfDocument(payload = {}) {
     }
     buffer = await fsp.readFile(openTarget);
   } else {
+    prefetchPdfInBackground(normalized);
     const fetched = await fetchPdfBuffer(openTarget, normalized);
     buffer = fetched.buffer;
     sourceUrl = fetched.sourceUrl;

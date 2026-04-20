@@ -1195,6 +1195,60 @@ textarea {
   padding-bottom: 20px;
 }
 
+.embedded-pdf-pages {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  align-items: center;
+  padding-bottom: 18px;
+}
+
+.embedded-pdf-page {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.embedded-pdf-page-meta {
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--muted);
+}
+
+.embedded-pdf-page-shell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+}
+
+.embedded-pdf-page-placeholder,
+.embedded-pdf-page-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 16px;
+  padding: 18px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.embedded-pdf-page-placeholder {
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+}
+
+.embedded-pdf-page-error {
+  background: rgba(255, 237, 213, 0.8);
+  color: var(--warning);
+}
+
 .embedded-pdf-canvas {
   display: block;
   max-width: 100%;
