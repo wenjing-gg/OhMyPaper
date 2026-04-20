@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const { execFile } = require('child_process');
+const crypto = require('crypto');
 const { pathToFileURL } = require('url');
 
 const DEFAULT_AI_CONFIG = {
@@ -22,6 +23,9 @@ const DEFAULT_AI_CONFIG = {
 const AI_REASONING_LEVELS = new Set(['high', 'medium', 'low', 'minimal']);
 let mainWindow = null;
 const pdfViewerWindows = new Set();
+const pdfPrefetchTasks = new Map();
+const pdfPrefetchStatuses = new Map();
+const PDF_CACHE_NAMESPACE = 'v1';
 
 function defaultAiConfigStatus(aiConfig = normalizeAiConfig()) {
   if (aiConfig.provider.requiresOpenAIAuth && !aiConfig.openAIApiKey) {
@@ -211,6 +215,10 @@ function isRemoteHttpUrl(url) {
   return /^https?:\/\//i.test(String(url || '').trim());
 }
 
+function sha1(value) {
+  return crypto.createHash('sha1').update(String(value || '')).digest('hex');
+}
+
 function favoriteKeyFromPaper(paper = {}) {
   const explicitKey = String(paper.favorite_key || '').trim();
   if (explicitKey) {
@@ -256,6 +264,295 @@ function favoriteKeyFromPaper(paper = {}) {
   }
 
   return '';
+}
+
+function pdfCacheDir() {
+  return path.join(app.getPath('userData'), 'pdf-cache', PDF_CACHE_NAMESPACE);
+}
+
+function normalizePdfPayload(payload = {}) {
+  const target = String(payload.target || payload.local_pdf_path || payload.pdf_url || '').trim();
+  const targetKind = String(payload.target_kind || (isRemoteHttpUrl(target) ? 'url' : 'path')).trim().toLowerCase() || 'path';
+  const paperKey = String(
+    payload.favorite_key
+    || favoriteKeyFromPaper(payload)
+    || payload.paper_key
+    || (target ? `pdf:${sha1(target)}` : '')
+  ).trim();
+  const sourceUrl = isRemoteHttpUrl(target)
+    ? target
+    : (isRemoteHttpUrl(payload.pdf_url) ? String(payload.pdf_url).trim() : '');
+  const localPath = !isRemoteHttpUrl(target) ? target : String(payload.local_pdf_path || '').trim();
+  const cachePath = sourceUrl ? path.join(pdfCacheDir(), `${sha1(`${paperKey}|${sourceUrl}`)}.pdf`) : '';
+  return {
+    ...payload,
+    paperKey,
+    title: String(payload.title || '论文 PDF').trim() || '论文 PDF',
+    sourceKind: String(payload.source_kind || '').trim().toLowerCase(),
+    target,
+    targetKind,
+    sourceUrl,
+    localPath,
+    cachePath,
+  };
+}
+
+function clonePdfStatus(status) {
+  return status ? JSON.parse(JSON.stringify(status)) : null;
+}
+
+function emitPdfPrefetchStatus(status) {
+  const normalized = clonePdfStatus(status);
+  if (!normalized?.paperKey) {
+    return normalized;
+  }
+  pdfPrefetchStatuses.set(normalized.paperKey, normalized);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('pdf:prefetch-status', normalized);
+  }
+  return normalized;
+}
+
+async function fileExists(filePath) {
+  try {
+    await fsp.access(filePath, fs.constants.F_OK);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function getCachedPdfStatus(normalized) {
+  if (!normalized?.paperKey) {
+    return null;
+  }
+  if (normalized.localPath) {
+    if (!(await fileExists(normalized.localPath))) {
+      return emitPdfPrefetchStatus({
+        paperKey: normalized.paperKey,
+        title: normalized.title,
+        state: 'error',
+        progress: 0,
+        target: normalized.target,
+        sourceUrl: '',
+        cachedPath: '',
+        openTarget: '',
+        message: '本地 PDF 文件不存在',
+      });
+    }
+    return emitPdfPrefetchStatus({
+      paperKey: normalized.paperKey,
+      title: normalized.title,
+      state: 'ready',
+      progress: 1,
+      target: normalized.localPath,
+      sourceUrl: '',
+      cachedPath: normalized.localPath,
+      openTarget: normalized.localPath,
+      message: '本地 PDF 已就绪',
+      isLocal: true,
+      isCached: true,
+    });
+  }
+  if (normalized.cachePath && await fileExists(normalized.cachePath)) {
+    return emitPdfPrefetchStatus({
+      paperKey: normalized.paperKey,
+      title: normalized.title,
+      state: 'ready',
+      progress: 1,
+      target: normalized.target,
+      sourceUrl: normalized.sourceUrl,
+      cachedPath: normalized.cachePath,
+      openTarget: normalized.cachePath,
+      message: 'PDF 已缓存',
+      isCached: true,
+    });
+  }
+  return clonePdfStatus(pdfPrefetchStatuses.get(normalized.paperKey) || null);
+}
+
+function validatePdfSignature(firstChunk, response, normalized) {
+  const contentType = String(response?.headers?.get?.('content-type') || '').toLowerCase();
+  if (contentType.includes('pdf')) {
+    return true;
+  }
+  const buffer = Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk || []);
+  if (buffer.length >= 4 && buffer.subarray(0, 4).toString('latin1') === '%PDF') {
+    return true;
+  }
+  if (looksLikePdfUrl(response?.url || normalized?.sourceUrl || '')) {
+    return true;
+  }
+  return false;
+}
+
+async function startPdfPrefetch(normalized) {
+  const existing = pdfPrefetchTasks.get(normalized.paperKey);
+  if (existing) {
+    return clonePdfStatus(pdfPrefetchStatuses.get(normalized.paperKey) || null);
+  }
+
+  const initialStatus = emitPdfPrefetchStatus({
+    paperKey: normalized.paperKey,
+    title: normalized.title,
+    state: 'downloading',
+    progress: 0,
+    target: normalized.target,
+    sourceUrl: normalized.sourceUrl,
+    cachedPath: '',
+    openTarget: normalized.sourceUrl || normalized.target,
+    message: '正在缓存 PDF…',
+    isCached: false,
+  });
+
+  const task = (async () => {
+    const tempPath = `${normalized.cachePath}.download`;
+    let fileHandle = null;
+    try {
+      await fsp.mkdir(path.dirname(normalized.cachePath), { recursive: true });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 180000);
+      const response = await fetch(normalized.sourceUrl, {
+        redirect: 'follow',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': `DeepXiv Client/${app.getVersion()}`,
+          'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+        },
+      });
+      clearTimeout(timer);
+
+      if (!response.ok) {
+        throw new Error(`下载 PDF 失败（${response.status}）`);
+      }
+
+      const totalBytes = Number(response.headers.get('content-length') || 0);
+      const reader = response.body?.getReader ? response.body.getReader() : null;
+      let receivedBytes = 0;
+      let firstChunk = Buffer.alloc(0);
+      fileHandle = await fsp.open(tempPath, 'w');
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = Buffer.from(value);
+          if (!firstChunk.length) {
+            firstChunk = chunk;
+          }
+          receivedBytes += chunk.length;
+          await fileHandle.write(chunk);
+          emitPdfPrefetchStatus({
+            ...initialStatus,
+            state: 'downloading',
+            progress: totalBytes > 0 ? Math.min(0.99, receivedBytes / totalBytes) : 0,
+            message: totalBytes > 0 ? `正在缓存 PDF… ${Math.round((receivedBytes / totalBytes) * 100)}%` : '正在缓存 PDF…',
+          });
+        }
+      } else {
+        const buffer = Buffer.from(await response.arrayBuffer());
+        firstChunk = buffer.subarray(0, Math.min(buffer.length, 8));
+        receivedBytes = buffer.length;
+        await fileHandle.write(buffer);
+      }
+
+      await fileHandle.close();
+      fileHandle = null;
+
+      if (!validatePdfSignature(firstChunk, response, normalized)) {
+        throw new Error('返回内容不是有效 PDF');
+      }
+
+      await fsp.rename(tempPath, normalized.cachePath);
+
+      emitPdfPrefetchStatus({
+        ...initialStatus,
+        state: 'ready',
+        progress: 1,
+        sourceUrl: response.url || normalized.sourceUrl,
+        cachedPath: normalized.cachePath,
+        openTarget: normalized.cachePath,
+        message: 'PDF 已缓存，下次打开更快',
+        isCached: true,
+        totalBytes: totalBytes || receivedBytes,
+        receivedBytes,
+      });
+    } catch (error) {
+      if (fileHandle) {
+        try {
+          await fileHandle.close();
+        } catch (closeError) {
+        }
+      }
+      await fsp.rm(tempPath, { force: true }).catch(() => {});
+      emitPdfPrefetchStatus({
+        ...initialStatus,
+        state: 'error',
+        progress: 0,
+        openTarget: normalized.sourceUrl || normalized.target,
+        message: String(error?.name || '') === 'AbortError' ? 'PDF 缓存超时，已回退直连打开' : 'PDF 缓存失败，已回退直连打开',
+        error: String(error?.message || error || 'PDF 缓存失败').trim(),
+        isCached: false,
+      });
+    } finally {
+      pdfPrefetchTasks.delete(normalized.paperKey);
+    }
+  })();
+
+  pdfPrefetchTasks.set(normalized.paperKey, task);
+  return initialStatus;
+}
+
+async function prefetchPdf(payload = {}) {
+  const normalized = normalizePdfPayload(payload);
+  if (!normalized.paperKey || !normalized.target) {
+    return {
+      paperKey: normalized.paperKey || '',
+      title: normalized.title,
+      state: 'missing',
+      progress: 0,
+      target: normalized.target,
+      sourceUrl: normalized.sourceUrl,
+      cachedPath: '',
+      openTarget: '',
+      message: '未找到可用 PDF',
+      isCached: false,
+    };
+  }
+
+  const cachedStatus = await getCachedPdfStatus(normalized);
+  if (cachedStatus?.state === 'ready') {
+    return cachedStatus;
+  }
+
+  if (normalized.sourceUrl && looksLikePdfUrl(normalized.sourceUrl)) {
+    return startPdfPrefetch(normalized);
+  }
+
+  return emitPdfPrefetchStatus({
+    paperKey: normalized.paperKey,
+    title: normalized.title,
+    state: 'missing',
+    progress: 0,
+    target: normalized.target,
+    sourceUrl: normalized.sourceUrl,
+    cachedPath: '',
+    openTarget: normalized.localPath || normalized.target,
+    message: '当前论文没有可缓存的 PDF 直链',
+    isCached: false,
+  });
+}
+
+async function resolvePdfForOpen(payload = {}) {
+  const normalized = normalizePdfPayload(payload);
+  const status = await prefetchPdf(payload);
+  const cachedStatus = await getCachedPdfStatus(normalized);
+  const effective = cachedStatus?.state === 'ready' ? cachedStatus : status;
+  return {
+    ...(effective || {}),
+    paperKey: normalized.paperKey,
+    openTarget: effective?.cachedPath || effective?.openTarget || normalized.localPath || normalized.sourceUrl || normalized.target,
+  };
 }
 
 function normalizeFavoriteEntry(paper = {}, fallbackKey = '') {
@@ -1156,6 +1453,8 @@ app.whenReady().then(() => {
   ipcMain.handle('token:register', () => callBridge('register-token'));
   ipcMain.handle('papers:search', (_, payload) => callBridge('search', payload));
   ipcMain.handle('papers:trending', (_, payload) => callBridge('trending', payload));
+  ipcMain.handle('pdf:prefetch', (_, payload) => prefetchPdf(payload));
+  ipcMain.handle('pdf:resolve', (_, payload) => resolvePdfForOpen(payload));
   ipcMain.handle('papers:snapshot', async (_, payload) => {
     const bridgePayload = typeof payload === 'string'
       ? { arxiv_id: payload }

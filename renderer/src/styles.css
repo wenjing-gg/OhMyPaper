@@ -270,6 +270,30 @@ textarea {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(255, 255, 255, 0.54));
 }
 
+.status-card {
+  gap: 14px;
+}
+
+.status-card-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.status-card-heading {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--text-strong);
+}
+
+.status-card-divider {
+  height: 1px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(148, 163, 184, 0.02), rgba(148, 163, 184, 0.22), rgba(148, 163, 184, 0.02));
+}
+
 .token-card-row,
 .sidebar-footer-row,
 .settings-status-row {
@@ -876,6 +900,25 @@ textarea {
   flex-wrap: wrap;
 }
 
+.pdf-prefetch-hint {
+  margin-top: 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.pdf-prefetch-hint.ready {
+  color: var(--success);
+}
+
+.pdf-prefetch-hint.downloading {
+  color: var(--primary-strong);
+}
+
+.pdf-prefetch-hint.error {
+  color: var(--warning);
+}
+
 .empty-state {
   display: flex;
   align-items: center;
@@ -1072,10 +1115,35 @@ textarea {
   background: rgba(255, 255, 255, 0.9);
 }
 
+.embedded-pdf-toolbar-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
 .embedded-pdf-title {
   font-size: 15px;
   font-weight: 800;
   color: var(--text-strong);
+}
+
+.embedded-pdf-status {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.embedded-pdf-status.ready {
+  color: var(--success);
+}
+
+.embedded-pdf-status.downloading {
+  color: var(--primary-strong);
+}
+
+.embedded-pdf-status.error {
+  color: var(--warning);
 }
 
 .embedded-pdf-frame {

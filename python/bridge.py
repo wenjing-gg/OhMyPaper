@@ -902,6 +902,55 @@ def paper_identity_key(item: Dict[str, Any]) -> str:
     return str(item.get("paper_key") or "")
 
 
+def paper_identity_aliases(item: Dict[str, Any]) -> List[str]:
+    aliases: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        key = str(value or "").strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        aliases.append(key)
+
+    doi = normalize_doi(item.get("doi"))
+    if doi:
+        add(f"doi:{doi}")
+
+    arxiv_id = str(item.get("arxiv_id") or "").strip().lower()
+    if arxiv_id:
+        add(f"arxiv:{arxiv_id}")
+
+    openalex_id = str(item.get("openalex_id") or "").strip().lower()
+    if openalex_id:
+        add(f"openalex:{openalex_id}")
+
+    europepmc_id = str(item.get("europepmc_id") or "").strip().lower()
+    europepmc_source = str(item.get("europepmc_source") or item.get("source_kind") or "europepmc").strip().lower()
+    if europepmc_id:
+        add(f"europepmc:{europepmc_source}:{europepmc_id}")
+
+    title_key = normalize_title_key(item.get("title"))
+    publish_year_match = re.search(r"\b(19|20)\d{2}\b", str(item.get("publish_at") or ""))
+    publish_year = publish_year_match.group(0) if publish_year_match else ""
+    first_author = normalize_title_key(re.split(r"[;,]", str(item.get("author_line") or ""))[0])
+
+    if title_key and publish_year:
+        add(f"title-year:{title_key}:{publish_year}")
+    if title_key and first_author and publish_year:
+        add(f"title-author-year:{title_key}:{first_author}:{publish_year}")
+    if title_key and first_author:
+        add(f"title-author:{title_key}:{first_author}")
+    if title_key:
+        add(f"title:{title_key}")
+
+    fallback = paper_identity_key(item)
+    if fallback:
+        add(fallback)
+
+    return aliases
+
+
 def source_group(item: Dict[str, Any]) -> str:
     source_kind = str(item.get("source_kind") or "").strip().lower()
     if source_kind in {"pubmed", "pmc", "preprint", "europepmc"}:
@@ -1056,10 +1105,10 @@ def merge_results(items: List[Dict[str, Any]], limit: int, max_per_group: Option
     merged: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for item in items:
-        key = paper_identity_key(item)
-        if not key or key in seen:
+        keys = paper_identity_aliases(item)
+        if not keys or any(key in seen for key in keys):
             continue
-        seen.add(key)
+        seen.update(keys)
         merged.append(item)
     merged.sort(
         key=lambda item: (
@@ -1212,7 +1261,64 @@ def cmd_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
     if local_pdf_path or source_kind == "local-pdf":
         if not local_pdf_path:
             raise ValueError("缺少本地 PDF 路径")
-        normalized = parse_local_pdf(local_pdf_path)
+        file_path = Path(str(local_pdf_path or "")).expanduser().resolve()
+        if not file_path.exists():
+            raise FileNotFoundError("未找到本地 PDF 文件")
+        if file_path.suffix.lower() != ".pdf":
+            raise ValueError("请选择 PDF 文件")
+
+        preview_title = normalize_spaces(payload.get("title"))
+        preview_author_line = normalize_spaces(payload.get("author_line"))
+        preview_abstract = clean_abstract_text(
+            normalize_spaces(payload.get("abstract")),
+            preview_title,
+            preview_author_line,
+        )
+        preview_publish_at = normalize_spaces(payload.get("publish_at"))
+        preview_external_url = normalize_spaces(payload.get("external_url")) or str(file_path)
+        preview_pdf_url = normalize_spaces(payload.get("pdf_url"))
+        preview_context_text = normalize_spaces(payload.get("full_context_text"))
+        preview_sections = [item for item in (payload.get("sections") or []) if isinstance(item, dict)]
+        preview_contribution_points = [
+            normalize_spaces(item)
+            for item in (payload.get("contribution_points") or [])
+            if normalize_spaces(item)
+        ]
+
+        has_preview_snapshot = any([
+            preview_title,
+            preview_author_line,
+            preview_abstract,
+            preview_context_text,
+            preview_sections,
+            preview_contribution_points,
+        ])
+
+        if has_preview_snapshot:
+            normalized = {
+                "paper_key": str(payload.get("paper_key") or local_pdf_key(file_path)),
+                "favorite_key": str(payload.get("favorite_key") or local_pdf_key(file_path)),
+                "source_kind": "local-pdf",
+                "source_label": normalize_spaces(payload.get("source_label")) or "本地 PDF",
+                "title": preview_title or file_path.stem,
+                "abstract": preview_abstract,
+                "author_line": preview_author_line,
+                "publish_at": preview_publish_at,
+                "arxiv_id": "",
+                "openalex_id": "",
+                "europepmc_id": "",
+                "europepmc_source": "",
+                "external_url": preview_external_url,
+                "src_url": preview_external_url,
+                "pdf_url": preview_pdf_url,
+                "local_pdf_path": str(file_path),
+                "supports_favorite": bool(payload.get("supports_favorite", True)),
+                "full_context_text": preview_context_text,
+                "contribution_points": preview_contribution_points,
+                "sections": preview_sections,
+            }
+        else:
+            normalized = parse_local_pdf(str(file_path))
         brief = {
             "title": normalized.get("title", "Untitled"),
             "tldr": normalized.get("abstract", ""),

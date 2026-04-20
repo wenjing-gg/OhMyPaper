@@ -196,6 +196,8 @@ const DEFAULT_AI_CONFIG = {
   },
 };
 
+const AI_CHAT_STORAGE_KEY = 'deepxiv-ai-chat-histories-v1';
+
 function defaultAiConfigStatus(aiConfig = normalizeAiConfig()) {
   if (aiConfig.provider.requiresOpenAIAuth && !aiConfig.openAIApiKey) {
     return {
@@ -289,6 +291,146 @@ function getFavoriteKey(paper) {
   }
 
   return '';
+}
+
+function normalizeSearchKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/\W+/g, ' ').trim();
+}
+
+function extractPublishYear(value) {
+  const match = String(value || '').match(/\b(19|20)\d{2}\b/);
+  return match ? match[0] : '';
+}
+
+function getPaperDedupeKeys(rawPaper) {
+  const paper = normalizePaper(rawPaper || {});
+  const keys = new Set();
+  const doi = normalizeSearchKey(String(paper?.doi || '').replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, ''));
+  const titleKey = normalizeSearchKey(paper.title || '');
+  const yearKey = extractPublishYear(paper.publish_at || paper.published_at || paper.published || paper.created_at || '');
+  const authorKey = normalizeSearchKey(String(paper.author_line || '').split(/[;,]/)[0] || '');
+
+  if (doi) keys.add(`doi:${doi}`);
+  if (paper.arxiv_id) keys.add(`arxiv:${String(paper.arxiv_id).trim().toLowerCase()}`);
+  if (paper.openalex_id) keys.add(`openalex:${String(paper.openalex_id).trim().toLowerCase()}`);
+  if (paper.europepmc_id) keys.add(`europepmc:${String(paper.europepmc_source || paper.source_kind || 'europepmc').trim().toLowerCase()}:${String(paper.europepmc_id).trim().toLowerCase()}`);
+  if (titleKey && yearKey) keys.add(`title-year:${titleKey}:${yearKey}`);
+  if (titleKey && authorKey && yearKey) keys.add(`title-author-year:${titleKey}:${authorKey}:${yearKey}`);
+  if (titleKey && authorKey) keys.add(`title-author:${titleKey}:${authorKey}`);
+  if (titleKey) keys.add(`title:${titleKey}`);
+
+  return [...keys].filter(Boolean);
+}
+
+function dedupePapers(items) {
+  const seen = new Set();
+  const result = [];
+
+  for (const rawPaper of items || []) {
+    const paper = normalizePaper(rawPaper);
+    const keys = getPaperDedupeKeys(paper);
+    if (keys.some((key) => seen.has(key))) {
+      continue;
+    }
+    keys.forEach((key) => seen.add(key));
+    result.push(paper);
+  }
+
+  return result;
+}
+
+function normalizeAiConversationMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .map((message, index) => ({
+      role: message?.role === 'assistant' ? 'assistant' : 'user',
+      content: String(message?.content || '').trim(),
+      isError: message?.isError === true,
+      thinkingState: message?.thinkingState === 'done' ? 'done' : (message?.thinkingState === 'thinking' ? 'thinking' : ''),
+      reasoningSummary: String(message?.reasoningSummary || '').trim(),
+      reasoningSteps: Array.isArray(message?.reasoningSteps)
+        ? message.reasoningSteps
+            .map((step, stepIndex) => ({
+              id: String(step?.id || `reasoning-${index + 1}-${stepIndex + 1}`),
+              text: String(step?.text || '').trim(),
+            }))
+            .filter((step) => step.text)
+        : [],
+    }))
+    .filter((message) => message.content)
+    .slice(-40);
+}
+
+function loadAiChatStore() {
+  if (typeof window === 'undefined' || !window.localStorage) return {};
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(AI_CHAT_STORAGE_KEY) || '{}');
+    return Object.fromEntries(
+      Object.entries(raw || {})
+        .map(([key, messages]) => [String(key || '').trim(), normalizeAiConversationMessages(messages)])
+        .filter(([key, messages]) => key && messages.length)
+    );
+  } catch (error) {
+    return {};
+  }
+}
+
+function saveAiChatStore(store) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(AI_CHAT_STORAGE_KEY, JSON.stringify(store || {}));
+  } catch (error) {
+  }
+}
+
+function getPaperSessionKey(snapshot, rawPaper) {
+  const paper = normalizePaper({
+    ...(rawPaper || {}),
+    source_kind: snapshot?.source_kind || rawPaper?.source_kind,
+    source_label: snapshot?.source_label || rawPaper?.source_label,
+    arxiv_id: snapshot?.arxiv_id || rawPaper?.arxiv_id,
+    openalex_id: snapshot?.openalex_id || rawPaper?.openalex_id,
+    europepmc_id: snapshot?.europepmc_id || rawPaper?.europepmc_id,
+    europepmc_source: snapshot?.europepmc_source || rawPaper?.europepmc_source,
+    local_pdf_path: snapshot?.local_pdf_path || rawPaper?.local_pdf_path,
+    title: snapshot?.brief?.title || snapshot?.head?.title || rawPaper?.title,
+    external_url: snapshot?.head?.src_url || snapshot?.brief?.src_url || rawPaper?.external_url || rawPaper?.src_url,
+  });
+  return getFavoriteKey(paper) || paper.paper_key || '';
+}
+
+function getAiConversationKey(snapshot, rawPaper) {
+  return getPaperSessionKey(snapshot, rawPaper);
+}
+
+function normalizePdfPrefetchStatus(raw) {
+  const next = raw || {};
+  return {
+    paperKey: String(next.paperKey || next.paper_key || '').trim(),
+    state: String(next.state || '').trim() || 'idle',
+    progress: Number.isFinite(Number(next.progress)) ? Math.max(0, Math.min(1, Number(next.progress))) : 0,
+    message: String(next.message || '').trim(),
+    target: String(next.target || '').trim(),
+    sourceUrl: String(next.sourceUrl || next.source_url || '').trim(),
+    cachedPath: String(next.cachedPath || next.cached_path || '').trim(),
+    openTarget: String(next.openTarget || next.open_target || '').trim(),
+    isCached: next.isCached === true,
+    isLocal: next.isLocal === true,
+    error: String(next.error || '').trim(),
+  };
+}
+
+function formatPdfPrefetchMessage(status) {
+  if (!status) return '';
+  if (status.isLocal) return '本地 PDF，打开最快';
+  if (status.state === 'ready' && status.cachedPath) return status.message || 'PDF 已缓存，下次打开更快';
+  if (status.state === 'downloading') {
+    return status.message || (status.progress > 0 ? `正在缓存 PDF… ${Math.round(status.progress * 100)}%` : '正在缓存 PDF…');
+  }
+  if (status.state === 'error') {
+    return status.message || 'PDF 缓存失败，已回退直连打开';
+  }
+  return status.message || '';
 }
 
 function normalizePaper(paper) {
@@ -421,6 +563,32 @@ function buildEmbeddedPdfSrc(target) {
   return base || '';
 }
 
+function buildPdfPrefetchPayload(snapshot, rawPaper) {
+  const paper = normalizePaper(rawPaper || {});
+  const target = resolveOpenTarget(snapshot, paper);
+  if (!target?.value) return null;
+  if (target.kind !== 'path' && !looksLikePdfUrl(target.value)) {
+    return null;
+  }
+
+  return {
+    paper_key: paper.paper_key,
+    favorite_key: getPaperSessionKey(snapshot, paper),
+    source_kind: snapshot?.source_kind || paper.source_kind,
+    source_label: snapshot?.source_label || paper.source_label,
+    arxiv_id: snapshot?.arxiv_id || paper.arxiv_id,
+    openalex_id: snapshot?.openalex_id || paper.openalex_id,
+    europepmc_id: snapshot?.europepmc_id || paper.europepmc_id,
+    europepmc_source: snapshot?.europepmc_source || paper.europepmc_source,
+    title: snapshot?.brief?.title || snapshot?.head?.title || paper.title || '论文 PDF',
+    external_url: snapshot?.head?.src_url || snapshot?.brief?.src_url || paper.external_url || '',
+    pdf_url: resolvePdfUrl(snapshot, paper),
+    local_pdf_path: resolveLocalPdfPath(snapshot, paper),
+    target: target.value,
+    target_kind: target.kind,
+  };
+}
+
 function buildAiPaperContext(snapshot, rawPaper) {
   const paper = normalizePaper(rawPaper || {});
   const brief = snapshot?.brief || {};
@@ -461,15 +629,26 @@ function TitleWithSource({ title, sourceKind, sourceLabel }) {
   );
 }
 
-function EmbeddedPdfPane({ viewer, onClose }) {
+function EmbeddedPdfPane({ viewer, onClose, pdfStatus }) {
   if (!viewer?.target) return null;
 
   const frameSrc = buildEmbeddedPdfSrc(viewer.target);
+  const pdfStatusText = formatPdfPrefetchMessage(pdfStatus);
+  const pdfStatusClass = pdfStatus?.state === 'ready'
+    ? 'ready'
+    : pdfStatus?.state === 'downloading'
+      ? 'downloading'
+      : pdfStatus?.state === 'error'
+        ? 'error'
+        : 'idle';
 
   return (
     <div className="embedded-pdf-pane">
       <div className="embedded-pdf-toolbar">
-        <div className="embedded-pdf-title">PDF 阅读</div>
+        <div className="embedded-pdf-toolbar-copy">
+          <div className="embedded-pdf-title">PDF 阅读</div>
+          {pdfStatusText && <div className={`embedded-pdf-status ${pdfStatusClass}`}>{pdfStatusText}</div>}
+        </div>
         <div className="embedded-pdf-actions">
           <button className="mini-btn" onClick={onClose}>关闭 PDF</button>
         </div>
@@ -493,6 +672,7 @@ function makeExternalSnapshot(paper) {
     brief: {
       title: normalized.title,
       tldr: normalized.abstract,
+      author_line: normalized.author_line || '',
       publish_at: normalized.publish_at || '',
       src_url: srcUrl,
       pdf_url: normalized.pdf_url || '',
@@ -500,6 +680,7 @@ function makeExternalSnapshot(paper) {
     },
     head: {
       title: normalized.title,
+      author_line: normalized.author_line || '',
       abstract: normalized.abstract || '暂无内容',
       publish_at: normalized.publish_at || '',
       src_url: srcUrl,
@@ -579,9 +760,8 @@ function HistoryList({ items, activeKey, onSelect, emptyText }) {
   );
 }
 
-function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
+function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI, messages = [], onMessagesChange }) {
   const [draft, setDraft] = useState('');
-  const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const snapshotKey = snapshot?.arxiv_id || snapshot?.openalex_id || snapshot?.europepmc_id || paper?.paper_key || paper?.title || '';
   const paperContext = useMemo(() => buildAiPaperContext(snapshot, paper), [snapshot, paper, snapshotKey]);
@@ -602,7 +782,6 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
 
   useEffect(() => {
     setDraft('');
-    setMessages([]);
     setLoading(false);
   }, [snapshotKey]);
 
@@ -610,12 +789,13 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
     const prompt = draft.trim();
     if (!prompt || loading || !snapshot) return;
     const history = messages.map((item) => ({ role: item.role, content: item.content }));
-    setMessages((prev) => [...prev, { role: 'user', content: prompt }]);
+    const nextUserMessages = [...messages, { role: 'user', content: prompt }];
+    onMessagesChange?.(nextUserMessages);
     setDraft('');
     setLoading(true);
     try {
       const result = await onAskAI({ paperContext, messages: history, prompt });
-      setMessages((prev) => [...prev, {
+      onMessagesChange?.([...nextUserMessages, {
         role: 'assistant',
         content: result.answer,
         thinkingState: 'done',
@@ -630,7 +810,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
           : [],
       }]);
     } catch (error) {
-      setMessages((prev) => [...prev, { role: 'assistant', content: toUserErrorMessage(error, 'AI 请求失败'), isError: true }]);
+      onMessagesChange?.([...nextUserMessages, { role: 'assistant', content: toUserErrorMessage(error, 'AI 请求失败'), isError: true }]);
     } finally {
       setLoading(false);
     }
@@ -717,19 +897,21 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
   );
 }
 
-function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite, onOpenPdf, loading, emptyText, aiConfig, aiConfigStatus, onAskAI, embeddedPdf, onClosePdf }) {
-  if (loading) return <EmptyState text="正在加载论文详情…" />;
-  if (!snapshot) return <EmptyState text={emptyText} />;
+function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite, onOpenPdf, emptyText, aiConfig, aiConfigStatus, onAskAI, embeddedPdf, onClosePdf, aiMessages, onAiMessagesChange, pdfStatus }) {
+  const effectiveSnapshot = snapshot || (paper ? makeExternalSnapshot(paper) : null);
+  if (!effectiveSnapshot) return <EmptyState text={emptyText} />;
 
-  const brief = snapshot.brief || {};
-  const head = snapshot.head || {};
-  const sourceKind = snapshot.source_kind || paper?.source_kind || 'paper';
-  const sourceLabel = snapshot.source_label || paper?.source_label || SOURCE_LABELS[sourceKind] || '论文';
+  const brief = effectiveSnapshot.brief || {};
+  const head = effectiveSnapshot.head || {};
+  const sourceKind = effectiveSnapshot.source_kind || paper?.source_kind || 'paper';
+  const sourceLabel = effectiveSnapshot.source_label || paper?.source_label || SOURCE_LABELS[sourceKind] || '论文';
   const title = brief.title || head.title || paper?.title || 'Untitled';
-  const paperId = snapshot.arxiv_id || snapshot.openalex_id || snapshot.europepmc_id || paper?.arxiv_id || paper?.openalex_id || paper?.europepmc_id || '';
-  const meta = [paperId, brief.publish_at || head.publish_at || '', `引用 ${brief.citations || head.citations || 0}`].filter(Boolean).join(' · ');
-  const openTarget = resolveOpenTarget(snapshot, paper);
+  const authorLine = head.author_line || brief.author_line || paper?.author_line || '';
+  const paperId = effectiveSnapshot.arxiv_id || effectiveSnapshot.openalex_id || effectiveSnapshot.europepmc_id || paper?.arxiv_id || paper?.openalex_id || paper?.europepmc_id || '';
+  const meta = [authorLine, paperId, brief.publish_at || head.publish_at || paper?.publish_at || '', `引用 ${brief.citations || head.citations || 0}`].filter(Boolean).join(' · ');
+  const openTarget = resolveOpenTarget(effectiveSnapshot, paper);
   const openLabel = openTarget?.kind === 'path' || looksLikePdfUrl(openTarget?.value) || sourceKind === 'local-pdf' || sourceKind === 'arxiv' ? '打开 PDF' : '打开来源';
+  const pdfStatusText = formatPdfPrefetchMessage(pdfStatus);
 
   if (embeddedPdf?.target) {
     return (
@@ -737,6 +919,7 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
         <EmbeddedPdfPane
           viewer={embeddedPdf}
           onClose={onClosePdf}
+          pdfStatus={pdfStatus}
         />
       </div>
     );
@@ -756,8 +939,9 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
             <button className="btn" disabled={!canFavorite} onClick={onToggleFavorite}>{canFavorite ? (isFavorite ? '取消收藏' : '加入收藏') : '暂不支持收藏'}</button>
             <button className="btn" disabled={!openTarget} onClick={onOpenPdf}>{openLabel}</button>
           </div>
+          {pdfStatusText && <div className={`pdf-prefetch-hint ${pdfStatus?.state || 'idle'}`}>{pdfStatusText}</div>}
         </div>
-          <AIChatPanel snapshot={snapshot} paper={paper} aiConfig={aiConfig} aiConfigStatus={aiConfigStatus} onAskAI={onAskAI} />
+          <AIChatPanel snapshot={effectiveSnapshot} paper={paper} aiConfig={aiConfig} aiConfigStatus={aiConfigStatus} onAskAI={onAskAI} messages={aiMessages} onMessagesChange={onAiMessagesChange} />
         </div>
       </div>
 
@@ -785,12 +969,13 @@ export default function App() {
   const [activePaper, setActivePaper] = useState({ search: null, library: null, history: null });
   const [snapshots, setSnapshots] = useState({ search: null, library: null, history: null });
   const [embeddedPdf, setEmbeddedPdf] = useState({ search: null, library: null, history: null });
-  const [loadingDetail, setLoadingDetail] = useState({ search: false, library: false, history: false });
   const [activeHistoryKey, setActiveHistoryKey] = useState('');
   const [tokenInput, setTokenInput] = useState('');
   const [aiConfig, setAiConfig] = useState(normalizeAiConfig());
   const [aiConfigStatus, setAiConfigStatus] = useState(defaultAiConfigStatus(normalizeAiConfig()));
   const [aiConfigForm, setAiConfigForm] = useState(normalizeAiConfig());
+  const [aiChatStore, setAiChatStore] = useState(() => loadAiChatStore());
+  const [pdfPrefetchStore, setPdfPrefetchStore] = useState({});
 
   const pageMeta = PAGE_META[page];
   const favoriteKeys = useMemo(() => new Set(favorites.map((item) => getFavoriteKey(item)).filter(Boolean)), [favorites]);
@@ -863,13 +1048,93 @@ export default function App() {
     }
   }, [favoriteGroups, activeGroupId]);
 
+  useEffect(() => {
+    const unsubscribe = window.deepxiv.onPdfPrefetchStatus?.((payload) => {
+      const status = normalizePdfPrefetchStatus(payload);
+      if (!status.paperKey) return;
+      setPdfPrefetchStore((prev) => ({ ...prev, [status.paperKey]: status }));
+    });
+    return () => unsubscribe?.();
+  }, []);
+
+  useEffect(() => {
+    saveAiChatStore(aiChatStore);
+  }, [aiChatStore]);
+
+  useEffect(() => {
+    setEmbeddedPdf((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const context of Object.keys(prev)) {
+        const viewer = prev[context];
+        if (!viewer?.target || !viewer?.paperKey) continue;
+        const status = pdfPrefetchStore[viewer.paperKey];
+        if (!status?.cachedPath || status.state !== 'ready') continue;
+        if (viewer.target === status.cachedPath) continue;
+        if (!isRemoteHttpUrl(viewer.target)) continue;
+        next[context] = { ...viewer, target: status.cachedPath };
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [pdfPrefetchStore]);
+
+  function getAiConversationMessages(snapshot, paper) {
+    const key = getAiConversationKey(snapshot, paper);
+    return key ? (aiChatStore[key] || []) : [];
+  }
+
+  function setAiConversationMessages(snapshot, paper, messages) {
+    const key = getAiConversationKey(snapshot, paper);
+    if (!key) return;
+    const normalized = normalizeAiConversationMessages(messages);
+    setAiChatStore((prev) => {
+      if (!normalized.length) {
+        if (!prev[key]) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return { ...prev, [key]: normalized };
+    });
+  }
+
+  function mergePdfPrefetchStatus(rawStatus) {
+    const status = normalizePdfPrefetchStatus(rawStatus);
+    if (!status.paperKey) return status;
+    setPdfPrefetchStore((prev) => ({ ...prev, [status.paperKey]: status }));
+    return status;
+  }
+
+  function getPdfStatus(snapshot, paper) {
+    const key = getPaperSessionKey(snapshot, paper);
+    return key ? (pdfPrefetchStore[key] || null) : null;
+  }
+
+  async function prefetchPdfForPaper(snapshot, paper) {
+    const payload = buildPdfPrefetchPayload(snapshot, paper);
+    if (!payload) return null;
+    try {
+      return mergePdfPrefetchStatus(await window.deepxiv.prefetchPdf(payload));
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async function resolvePdfOpenForPaper(snapshot, paper) {
+    const payload = buildPdfPrefetchPayload(snapshot, paper);
+    if (!payload) return null;
+    return mergePdfPrefetchStatus(await window.deepxiv.resolvePdf(payload));
+  }
+
   async function openPaper(context, rawPaper, options = {}) {
     const paper = normalizePaper(rawPaper);
     const canLoadSnapshot = Boolean(paper.arxiv_id || paper.openalex_id || paper.europepmc_id || paper.local_pdf_path || paper.source_kind === 'local-pdf');
+    const previewSnapshot = makeExternalSnapshot(paper);
     setActivePaper((prev) => ({ ...prev, [context]: paper }));
+    setSnapshots((prev) => ({ ...prev, [context]: previewSnapshot }));
     setEmbeddedPdf((prev) => ({ ...prev, [context]: null }));
-    setLoadingDetail((prev) => ({ ...prev, [context]: true }));
-    setStatusText('正在加载论文详情…');
+    void prefetchPdfForPaper(previewSnapshot, paper);
     try {
       if (canLoadSnapshot) {
         const snapshot = await window.deepxiv.snapshot({
@@ -881,32 +1146,35 @@ export default function App() {
           europepmc_source: paper.europepmc_source,
           source_kind: paper.source_kind,
           source_label: paper.source_label,
+          title: paper.title,
+          publish_at: paper.publish_at,
           external_url: paper.external_url,
+          pdf_url: paper.pdf_url,
           local_pdf_path: paper.local_pdf_path,
           author_line: paper.author_line,
           abstract: paper.abstract,
           full_context_text: paper.full_context_text,
+          sections: paper.sections,
+          contribution_points: paper.contribution_points,
           supports_favorite: paper.supports_favorite,
           trackHistory: options.trackHistory !== false
         });
         setSnapshots((prev) => ({ ...prev, [context]: snapshot }));
+        void prefetchPdfForPaper(snapshot, paper);
         if (options.trackHistory !== false) {
           const nextHistory = await window.deepxiv.historyList();
           setHistory(nextHistory || []);
         }
       } else {
-        setSnapshots((prev) => ({ ...prev, [context]: makeExternalSnapshot(paper) }));
+        setSnapshots((prev) => ({ ...prev, [context]: previewSnapshot }));
         if (options.trackHistory !== false) {
           const nextHistory = await window.deepxiv.historyAdd({ kind: 'paper', payload: paper });
           setHistory(nextHistory || []);
         }
       }
     } catch (error) {
-      setSnapshots((prev) => ({ ...prev, [context]: null }));
+      setSnapshots((prev) => ({ ...prev, [context]: previewSnapshot }));
       setStatusText(toUserErrorMessage(error, '加载详情失败'));
-    } finally {
-      setLoadingDetail((prev) => ({ ...prev, [context]: false }));
-      setStatusText('');
     }
   }
 
@@ -916,7 +1184,7 @@ export default function App() {
     setStatusText(showSearchLimit ? '正在搜索论文…' : '正在打开论文…');
     try {
       const result = await window.deepxiv.search({ query, limit: Number(searchLimit), mode: searchMode, source_scope: searchSourceScope });
-      const papers = sortPapersByTime((result.results || []).map(normalizePaper));
+      const papers = dedupePapers(sortPapersByTime((result.results || []).map(normalizePaper)));
       setSearchResults(papers);
       if (papers[0]) {
         await openPaper('search', papers[0]);
@@ -1137,9 +1405,11 @@ export default function App() {
     const target = resolveOpenTarget(snapshot, paper);
     if (!target?.value) return;
     if (target.kind === 'path' || looksLikePdfUrl(target.value)) {
+      const resolved = await resolvePdfOpenForPaper(snapshot, paper).catch(() => null);
       updateEmbeddedPdfViewer(context, {
-        target: target.value,
+        target: resolved?.openTarget || target.value,
         title: snapshot?.brief?.title || snapshot?.head?.title || paper?.title || '论文 PDF',
+        paperKey: getPaperSessionKey(snapshot, paper),
       });
       return;
     }
@@ -1190,16 +1460,31 @@ export default function App() {
           </div>
         </div>
 
-        <div className="token-card">
-          <div className="sidebar-label">账号连接</div>
-          <div className="token-card-row">
-            <div className="token-card-copy">
-              <div className="token-label">DeepXiv Token</div>
-              <div className="token-state">{tokenStatusLabel}</div>
+        <div className="token-card status-card">
+          <div className="sidebar-label">连接与 AI</div>
+          <div className="status-card-section">
+            <div className="status-card-heading">账号连接</div>
+            <div className="token-card-row">
+              <div className="token-card-copy">
+                <div className="token-label">DeepXiv Token</div>
+                <div className="token-state">{tokenStatusLabel}</div>
+              </div>
+              <div className={`token-indicator ${tokenIndicatorClass}`} title={token?.has_token ? 'Token 可用' : 'Token 未配置'}>{tokenIndicator}</div>
             </div>
-            <div className={`token-indicator ${tokenIndicatorClass}`} title={token?.has_token ? 'Token 可用' : 'Token 未配置'}>{tokenIndicator}</div>
+            <div className="token-value">{tokenStatusHint}</div>
           </div>
-          <div className="token-value">{tokenStatusHint}</div>
+          <div className="status-card-divider" />
+          <div className="status-card-section">
+            <div className="status-card-heading">AI 状态</div>
+            <div className="sidebar-footer-row">
+              <div className={`token-indicator ${aiIndicatorClass}`} title={aiStatusHint}>{aiIndicator}</div>
+              <div className="sidebar-footer-copy">
+                <div className="sidebar-footer-label">{aiStatusLabel}</div>
+                <div className="sidebar-footer-meta">{aiConfig?.provider?.name || aiConfig?.modelProvider || 'fox'} · {aiConfig?.model || 'gpt-5.4'}</div>
+              </div>
+            </div>
+            <div className="sidebar-footer-hint">{aiStatusHint}</div>
+          </div>
         </div>
 
         <nav className="nav">
@@ -1213,18 +1498,6 @@ export default function App() {
             </button>
           ))}
         </nav>
-
-        <div className="card sidebar-footer">
-          <div className="sidebar-label">AI 状态</div>
-          <div className="sidebar-footer-row">
-            <div className={`token-indicator ${aiIndicatorClass}`} title={aiStatusHint}>{aiIndicator}</div>
-            <div className="sidebar-footer-copy">
-              <div className="sidebar-footer-label">{aiStatusLabel}</div>
-              <div className="sidebar-footer-meta">{aiConfig?.provider?.name || aiConfig?.modelProvider || 'fox'} · {aiConfig?.model || 'gpt-5.4'}</div>
-            </div>
-          </div>
-          <div className="sidebar-footer-hint">{aiStatusHint}</div>
-        </div>
       </aside>
 
       <main className="content">
@@ -1279,13 +1552,15 @@ export default function App() {
                   canFavorite={Boolean(activePaper.search?.supports_favorite)}
                   onToggleFavorite={() => handleToggleFavorite('search')}
                   onOpenPdf={() => openPaperAsset('search', snapshots.search, activePaper.search)}
-                  loading={loadingDetail.search}
                   emptyText="请选择一篇论文。"
                   aiConfig={aiConfig}
                   aiConfigStatus={aiConfigStatus}
                   onAskAI={handleAskAI}
                   embeddedPdf={embeddedPdf.search}
                   onClosePdf={() => closeEmbeddedPdf('search')}
+                  aiMessages={getAiConversationMessages(snapshots.search, activePaper.search)}
+                  onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.search, activePaper.search, messages)}
+                  pdfStatus={getPdfStatus(snapshots.search, activePaper.search)}
                 />
               </div>
             </div>
@@ -1401,13 +1676,15 @@ export default function App() {
                   canFavorite={Boolean(activePaper.library?.supports_favorite)}
                   onToggleFavorite={() => handleToggleFavorite('library')}
                   onOpenPdf={() => openPaperAsset('library', snapshots.library, activePaper.library)}
-                  loading={loadingDetail.library}
                   emptyText="请选择一篇收藏论文。"
                   aiConfig={aiConfig}
                   aiConfigStatus={aiConfigStatus}
                   onAskAI={handleAskAI}
                   embeddedPdf={embeddedPdf.library}
                   onClosePdf={() => closeEmbeddedPdf('library')}
+                  aiMessages={getAiConversationMessages(snapshots.library, activePaper.library)}
+                  onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.library, activePaper.library, messages)}
+                  pdfStatus={getPdfStatus(snapshots.library, activePaper.library)}
                 />
               </div>
             </div>
@@ -1428,13 +1705,15 @@ export default function App() {
                   canFavorite={Boolean(activePaper.history?.supports_favorite)}
                   onToggleFavorite={() => handleToggleFavorite('history')}
                   onOpenPdf={() => openPaperAsset('history', snapshots.history, activePaper.history)}
-                  loading={loadingDetail.history}
                   emptyText="请选择一篇最近访问的论文。"
                   aiConfig={aiConfig}
                   aiConfigStatus={aiConfigStatus}
                   onAskAI={handleAskAI}
                   embeddedPdf={embeddedPdf.history}
                   onClosePdf={() => closeEmbeddedPdf('history')}
+                  aiMessages={getAiConversationMessages(snapshots.history, activePaper.history)}
+                  onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.history, activePaper.history, messages)}
+                  pdfStatus={getPdfStatus(snapshots.history, activePaper.history)}
                 />
               </div>
             </div>

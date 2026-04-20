@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('deepxiv', {
   registerToken: () => ipcRenderer.invoke('token:register'),
   search: (payload) => ipcRenderer.invoke('papers:search', payload),
   trending: (payload) => ipcRenderer.invoke('papers:trending', payload),
+  prefetchPdf: (payload) => ipcRenderer.invoke('pdf:prefetch', payload),
+  resolvePdf: (payload) => ipcRenderer.invoke('pdf:resolve', payload),
   snapshot: (payload) => ipcRenderer.invoke('papers:snapshot', payload),
   section: (payload) => ipcRenderer.invoke('papers:section', payload),
   favoritesList: () => ipcRenderer.invoke('favorites:list'),
@@ -25,5 +27,13 @@ contextBridge.exposeInMainWorld('deepxiv', {
   aiChat: (payload) => ipcRenderer.invoke('ai:chat', payload),
   openPdfViewer: (payload) => ipcRenderer.invoke('pdf:openViewer', payload),
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
-  openPath: (targetPath) => ipcRenderer.invoke('shell:openPath', targetPath)
+  openPath: (targetPath) => ipcRenderer.invoke('shell:openPath', targetPath),
+  onPdfPrefetchStatus: (callback) => {
+    if (typeof callback !== 'function') {
+      return () => {};
+    }
+    const listener = (_, payload) => callback(payload);
+    ipcRenderer.on('pdf:prefetch-status', listener);
+    return () => ipcRenderer.removeListener('pdf:prefetch-status', listener);
+  }
 });
