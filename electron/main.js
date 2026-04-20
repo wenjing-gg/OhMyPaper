@@ -379,24 +379,50 @@ function extractResponseText(payload) {
 }
 
 function extractReasoningSummary(payload) {
-  const fragments = [];
-  const seen = new Set();
-  const push = (value) => {
+  return extractReasoningArtifacts(payload).summaryText;
+}
+
+function extractReasoningArtifacts(payload) {
+  const summaryFragments = [];
+  const reasoningSteps = [];
+  const seenSummary = new Set();
+  const seenSteps = new Set();
+
+  const pushSummary = (value) => {
     const normalized = String(value || '').replace(/\s+/g, ' ').trim();
     if (!normalized) return;
     const key = normalized.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    fragments.push(normalized);
+    if (seenSummary.has(key)) return;
+    seenSummary.add(key);
+    summaryFragments.push(normalized);
   };
 
-  const visit = (node) => {
+  const pushStep = (value) => {
+    const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return;
+    const key = normalized.toLowerCase();
+    if (seenSteps.has(key)) return;
+    seenSteps.add(key);
+    reasoningSteps.push({
+      id: `reasoning-${reasoningSteps.length + 1}`,
+      text: normalized,
+    });
+  };
+
+  const visit = (node, context = {}) => {
     if (!node) return;
     if (Array.isArray(node)) {
-      node.forEach(visit);
+      node.forEach((item) => visit(item, context));
       return;
     }
     if (typeof node === 'string') {
+      if (context.summary) {
+        pushSummary(node);
+        return;
+      }
+      if (context.reasoning) {
+        pushStep(node);
+      }
       return;
     }
     if (typeof node !== 'object') {
@@ -404,45 +430,71 @@ function extractReasoningSummary(payload) {
     }
 
     const nodeType = String(node.type || '').toLowerCase();
-    if ((nodeType.includes('summary') || nodeType.includes('reasoning_summary')) && typeof node.text === 'string') {
-      push(node.text);
+    const inReasoning = context.reasoning || nodeType.includes('reasoning');
+    const inSummary = context.summary || nodeType.includes('summary');
+
+    if (typeof node.text === 'string') {
+      if (inSummary) {
+        pushSummary(node.text);
+      } else if (inReasoning) {
+        pushStep(node.text);
+      }
+    }
+    if (inReasoning && typeof node.output_text === 'string') {
+      pushStep(node.output_text);
+    }
+    if (typeof node.reasoning_text === 'string') {
+      pushStep(node.reasoning_text);
     }
     if (typeof node.summary_text === 'string') {
-      push(node.summary_text);
+      pushSummary(node.summary_text);
     }
     if (typeof node.reasoning_summary_text === 'string') {
-      push(node.reasoning_summary_text);
+      pushSummary(node.reasoning_summary_text);
     }
     if (typeof node.summary === 'string') {
-      push(node.summary);
+      pushSummary(node.summary);
     }
     if (typeof node.reasoning_summary === 'string') {
-      push(node.reasoning_summary);
+      pushSummary(node.reasoning_summary);
     }
-    if (Array.isArray(node.summary)) {
-      visit(node.summary);
+    if (typeof node.delta === 'string') {
+      if (inSummary) {
+        pushSummary(node.delta);
+      } else if (inReasoning) {
+        pushStep(node.delta);
+      }
     }
-    if (Array.isArray(node.reasoning_summary)) {
-      visit(node.reasoning_summary);
-    }
-    if (Array.isArray(node.summaries)) {
-      visit(node.summaries);
-    }
-    visit(node.content);
-    visit(node.output);
+
+    visit(node.summary, { reasoning: true, summary: true });
+    visit(node.reasoning_summary, { reasoning: true, summary: true });
+    visit(node.summaries, { reasoning: true, summary: true });
+    visit(node.content, { reasoning: inReasoning, summary: inSummary });
+    visit(node.output, { reasoning: inReasoning, summary: inSummary });
+    visit(node.item, { reasoning: inReasoning, summary: inSummary });
   };
 
-  if (typeof payload?.reasoning_summary_text === 'string') {
-    push(payload.reasoning_summary_text);
+  if (typeof payload?.reasoning_text === 'string') {
+    pushStep(payload.reasoning_text);
   }
-  visit(payload?.output);
-  return fragments.join('\n');
+  if (typeof payload?.reasoning_summary_text === 'string') {
+    pushSummary(payload.reasoning_summary_text);
+  }
+  visit(payload?.reasoning_events, { reasoning: true });
+  visit(payload?.output, {});
+
+  return {
+    summaryText: summaryFragments.join('\n'),
+    steps: reasoningSteps,
+  };
 }
 
 function parseSsePayload(rawText) {
   const blocks = String(rawText || '').split('\n\n');
   const deltas = [];
+  const reasoningDeltas = [];
   const reasoningSummaryDeltas = [];
+  const reasoningEvents = [];
   let completedPayload = null;
   let errorMessage = '';
 
@@ -466,11 +518,18 @@ function parseSsePayload(rawText) {
     if (payload?.error?.message) {
       errorMessage = payload.error.message;
     }
+    const payloadType = String(payload?.type || '').toLowerCase();
     if (payload?.type === 'response.output_text.delta' && typeof payload.delta === 'string') {
       deltas.push(payload.delta);
     }
-    if (typeof payload?.delta === 'string' && /reasoning.*summary.*delta/i.test(String(payload?.type || ''))) {
+    if (typeof payload?.delta === 'string' && /reasoning.*summary.*delta/i.test(payloadType)) {
       reasoningSummaryDeltas.push(payload.delta);
+    }
+    if (typeof payload?.delta === 'string' && /reasoning(?!.*summary).*delta/i.test(payloadType)) {
+      reasoningDeltas.push(payload.delta);
+    }
+    if (payloadType.includes('reasoning') || String(payload?.item?.type || '').toLowerCase().includes('reasoning')) {
+      reasoningEvents.push(payload.item || payload);
     }
     if (payload?.type === 'response.completed') {
       completedPayload = payload.response || payload;
@@ -482,13 +541,25 @@ function parseSsePayload(rawText) {
   }
 
   const text = deltas.join('').trim();
+  const reasoningText = reasoningDeltas.join('').trim();
   const reasoningSummaryText = reasoningSummaryDeltas.join('').trim();
   if (text) {
-    return { output_text: text, output: completedPayload?.output || [], reasoning_summary_text: reasoningSummaryText };
+    return {
+      output_text: text,
+      output: completedPayload?.output || [],
+      reasoning_text: reasoningText,
+      reasoning_summary_text: reasoningSummaryText,
+      reasoning_events: reasoningEvents,
+    };
   }
 
   if (completedPayload) {
-    return reasoningSummaryText ? { ...completedPayload, reasoning_summary_text: reasoningSummaryText } : completedPayload;
+    return {
+      ...completedPayload,
+      ...(reasoningText ? { reasoning_text: reasoningText } : {}),
+      ...(reasoningSummaryText ? { reasoning_summary_text: reasoningSummaryText } : {}),
+      ...(reasoningEvents.length ? { reasoning_events: reasoningEvents } : {}),
+    };
   }
 
   throw new Error('AI 返回了空的流式响应');
@@ -899,9 +970,12 @@ async function callAi(payload = {}) {
     throw new Error(message);
   }
 
+  const reasoning = extractReasoningArtifacts(data);
+
   return {
     answer: extractResponseText(data),
-    reasoningSummary: extractReasoningSummary(data),
+    reasoningSummary: reasoning.summaryText,
+    reasoningSteps: reasoning.steps,
     usedPdfContext: Boolean(hasRemotePdfContext || hasTextContext),
     contextMode: hasRemotePdfContext ? 'pdf' : hasTextContext ? 'text' : 'metadata',
     providerName: aiConfig.provider.name || aiConfig.modelProvider,
@@ -912,25 +986,47 @@ async function callAi(payload = {}) {
 async function importLocalPdf(options = {}) {
   const picked = await dialog.showOpenDialog(mainWindow, {
     title: '导入本地 PDF',
-    properties: ['openFile'],
+    properties: ['openFile', 'multiSelections'],
     filters: [{ name: 'PDF', extensions: ['pdf'] }],
   });
-  if (picked.canceled || !picked.filePaths?.[0]) {
+  if (picked.canceled || !picked.filePaths?.length) {
     return { canceled: true, favorites: await listFavorites(), favoriteGroups: await listFavoriteGroups() };
   }
 
-  const imported = normalizeFavoriteEntry(await callBridge('import-local-pdf', { path: picked.filePaths[0] }));
   const state = await readState();
   const groupId = normalizeFavoriteGroupId(options.groupId, state.favoriteGroups);
-  state.favorites[imported.favorite_key] = {
-    ...imported,
-    group_id: groupId,
-  };
+  const importedItems = [];
+  const failedItems = [];
+
+  for (const filePath of picked.filePaths) {
+    try {
+      const imported = normalizeFavoriteEntry(await callBridge('import-local-pdf', { path: filePath }));
+      state.favorites[imported.favorite_key] = {
+        ...imported,
+        group_id: groupId,
+      };
+      importedItems.push(state.favorites[imported.favorite_key]);
+    } catch (error) {
+      failedItems.push({
+        path: filePath,
+        message: String(error?.message || '导入失败').trim() || '导入失败',
+      });
+    }
+  }
+
+  if (!importedItems.length && failedItems.length) {
+    throw new Error(failedItems[0].message || '导入本地 PDF 失败');
+  }
+
   await writeState(state);
 
   return {
     canceled: false,
-    imported: state.favorites[imported.favorite_key],
+    imported: importedItems[0] || null,
+    importedItems,
+    importedCount: importedItems.length,
+    failedItems,
+    failedCount: failedItems.length,
     favorites: await listFavorites(),
     favoriteGroups: await listFavoriteGroups(),
   };

@@ -1,10 +1,126 @@
 import { useEffect, useMemo, useState } from 'react';
 
+function renderInlineMarkdown(text, keyPrefix = 'md-inline') {
+  const source = String(text || '');
+  const parts = [];
+  const pattern = /(\*\*([^*]+)\*\*|`([^`]+)`|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\))/g;
+  let lastIndex = 0;
+  let match;
+  let index = 0;
+
+  while ((match = pattern.exec(source)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(source.slice(lastIndex, match.index));
+    }
+    if (match[2]) {
+      parts.push(<strong key={`${keyPrefix}-strong-${index}`}>{match[2]}</strong>);
+    } else if (match[3]) {
+      parts.push(<code key={`${keyPrefix}-code-${index}`}>{match[3]}</code>);
+    } else if (match[4] && match[5]) {
+      parts.push(
+        <a key={`${keyPrefix}-link-${index}`} href={match[5]} target="_blank" rel="noreferrer">
+          {match[4]}
+        </a>
+      );
+    }
+    lastIndex = pattern.lastIndex;
+    index += 1;
+  }
+
+  if (lastIndex < source.length) {
+    parts.push(source.slice(lastIndex));
+  }
+
+  return parts.length ? parts : source;
+}
+
+function MarkdownText({ text, className = '' }) {
+  const source = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!source) return null;
+
+  const lines = source.split('\n');
+  const blocks = [];
+  let paragraph = [];
+  let listItems = [];
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    const content = paragraph.join(' ');
+    blocks.push({ type: 'paragraph', text: content });
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!listItems.length) return;
+    blocks.push({ type: 'list', items: listItems });
+    listItems = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,3})\s+(.+)$/);
+    if (headingMatch) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: 'heading', level: headingMatch[1].length, text: headingMatch[2] });
+      continue;
+    }
+
+    const orderedMatch = line.match(/^\d+[.)]\s+(.+)$/);
+    const unorderedMatch = line.match(/^[-*+]\s+(.+)$/);
+    if (orderedMatch || unorderedMatch) {
+      flushParagraph();
+      listItems.push((orderedMatch || unorderedMatch)[1]);
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+
+  return (
+    <div className={`markdown-block ${className}`.trim()}>
+      {blocks.map((block, index) => {
+        if (block.type === 'heading') {
+          const HeadingTag = block.level === 1 ? 'h4' : block.level === 2 ? 'h5' : 'h6';
+          return <HeadingTag key={`md-heading-${index}`} className="markdown-heading">{renderInlineMarkdown(block.text, `heading-${index}`)}</HeadingTag>;
+        }
+        if (block.type === 'list') {
+          return (
+            <ul key={`md-list-${index}`} className="markdown-list">
+              {block.items.map((item, itemIndex) => (
+                <li key={`md-list-${index}-${itemIndex}`}>{renderInlineMarkdown(item, `list-${index}-${itemIndex}`)}</li>
+              ))}
+            </ul>
+          );
+        }
+        return <p key={`md-paragraph-${index}`} className="markdown-paragraph">{renderInlineMarkdown(block.text, `paragraph-${index}`)}</p>;
+      })}
+    </div>
+  );
+}
+
 const PAGE_META = {
   search: { title: '论文搜索', subtitle: '搜索论文并进行渐进式阅读' },
   library: { title: '收藏', subtitle: '管理收藏论文' },
   history: { title: '最近访问', subtitle: '查看最近打开的论文' },
   settings: { title: '设置', subtitle: '配置 DeepXiv Token 与 AI 助手' }
+};
+
+const PAGE_DECOR = {
+  search: { icon: '⌕', eyebrow: 'Discovery', note: '检索、筛选与沉浸式阅读' },
+  library: { icon: '★', eyebrow: 'Library', note: '分组管理、导入与持续积累' },
+  history: { icon: '◴', eyebrow: 'Recent', note: '回到最近打开过的论文现场' },
+  settings: { icon: '⚙', eyebrow: 'Connect', note: '连接 Token 与 AI 能力' }
 };
 
 const SEARCH_MODE_OPTIONS = [
@@ -502,7 +618,16 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
       setMessages((prev) => [...prev, {
         role: 'assistant',
         content: result.answer,
+        thinkingState: 'done',
         reasoningSummary: String(result.reasoningSummary || '').trim(),
+        reasoningSteps: Array.isArray(result.reasoningSteps)
+          ? result.reasoningSteps
+              .map((item, index) => ({
+                id: String(item?.id || `reasoning-${index + 1}`),
+                text: String(item?.text || '').trim(),
+              }))
+              .filter((item) => item.text)
+          : [],
       }]);
     } catch (error) {
       setMessages((prev) => [...prev, { role: 'assistant', content: toUserErrorMessage(error, 'AI 请求失败'), isError: true }]);
@@ -535,11 +660,31 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
         {messages.map((message, index) => (
           <div key={`${message.role}-${index}`} className={`ai-bubble ${message.role} ${message.isError ? 'error' : ''}`}>
             <div className="ai-bubble-role">{message.role === 'assistant' ? 'AI' : '你'}</div>
-            <div className="ai-bubble-text">{message.content}</div>
-            {message.role === 'assistant' && message.reasoningSummary && !message.isError && (
+            {message.role === 'assistant' && !message.isError && (
+              <div className={`ai-thinking-status ${message.thinkingState === 'done' ? 'done' : 'thinking'}`}>
+                {message.thinkingState === 'done' ? '思考完毕' : '思考中'}
+              </div>
+            )}
+            <MarkdownText text={message.content} className="ai-bubble-text markdown-light" />
+            {message.role === 'assistant' && !message.isError && (message.reasoningSteps?.length || message.reasoningSummary || message.thinkingState === 'done') && (
               <div className="ai-reasoning-block">
-                <div className="ai-reasoning-label">推理摘要</div>
-                <div className="ai-reasoning-text">{message.reasoningSummary}</div>
+                <div className="ai-reasoning-label">{message.reasoningSteps?.length ? '思考过程' : '思考结果'}</div>
+                {message.reasoningSteps?.length > 0 && (
+                  <div className="ai-reasoning-steps">
+                    {message.reasoningSteps.map((step, stepIndex) => (
+                      <div key={step.id || `reasoning-step-${stepIndex + 1}`} className="ai-reasoning-step">
+                        <span className="ai-reasoning-step-index">{stepIndex + 1}</span>
+                        <MarkdownText text={step.text} className="ai-reasoning-step-text markdown-light" />
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {message.reasoningSummary && (
+                  <MarkdownText text={message.reasoningSummary} className="ai-reasoning-text markdown-light" />
+                )}
+                {!message.reasoningSteps?.length && !message.reasoningSummary && (
+                  <div className="ai-reasoning-text">本次响应未返回可展示的详细思考过程。</div>
+                )}
               </div>
             )}
           </div>
@@ -547,6 +692,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI }) {
         {loading && (
           <div className="ai-bubble assistant thinking">
             <div className="ai-bubble-role">AI</div>
+            <div className="ai-thinking-status thinking">思考中</div>
             <div className="ai-bubble-text">正在结合论文上下文思考…</div>
           </div>
         )}
@@ -633,7 +779,7 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchSourceScope, setSearchSourceScope] = useState('mixed');
-  const [searchMode, setSearchMode] = useState('hybrid');
+  const [searchMode] = useState('hybrid');
   const [searchLimit, setSearchLimit] = useState(10);
   const [searchResults, setSearchResults] = useState([]);
   const [activePaper, setActivePaper] = useState({ search: null, library: null, history: null });
@@ -666,10 +812,8 @@ export default function App() {
     }
     return favorites.filter((paper) => (paper.group_id || defaultFavoriteGroupId) === activeGroupId);
   }, [favorites, activeGroupId, defaultFavoriteGroupId]);
-  const selectedSearchMode = useMemo(() => SEARCH_MODE_OPTIONS.find((item) => item.value === searchMode) || SEARCH_MODE_OPTIONS[0], [searchMode]);
   const selectedSearchSource = useMemo(() => SEARCH_SOURCE_OPTIONS.find((item) => item.value === searchSourceScope) || SEARCH_SOURCE_OPTIONS[0], [searchSourceScope]);
   const searchPlaceholder = selectedSearchSource?.placeholder || '输入关键词';
-  const showSearchMode = selectedSearchSource?.supportsSearchMode !== false;
   const showSearchLimit = selectedSearchSource?.supportsLimit !== false;
   const searchActionLabel = showSearchLimit ? '搜索' : '打开';
   const tokenIndicator = token?.has_token ? '✓' : '✕';
@@ -819,10 +963,23 @@ export default function App() {
       const nextFavorites = (result.favorites || []).map(normalizePaper);
       setFavorites(nextFavorites);
       setFavoriteGroups(result.favoriteGroups || favoriteGroups);
-      setStatusText('');
-      if (result?.imported) {
-        await openPaper('library', normalizePaper(result.imported));
+      const importedCount = Number(result?.importedCount || (Array.isArray(result?.importedItems) ? result.importedItems.length : result?.imported ? 1 : 0));
+      const failedCount = Number(result?.failedCount || (Array.isArray(result?.failedItems) ? result.failedItems.length : 0));
+      let statusMessage = '';
+      if (importedCount > 0) {
+        const statusParts = [`已导入 ${importedCount} 个 PDF`];
+        if (failedCount > 0) {
+          statusParts.push(`${failedCount} 个失败`);
+        }
+        statusMessage = statusParts.join('，');
+      } else {
+        statusMessage = failedCount > 0 ? `导入失败 ${failedCount} 个 PDF` : '';
       }
+      const firstImported = result?.imported || result?.importedItems?.[0];
+      if (firstImported) {
+        await openPaper('library', normalizePaper(firstImported));
+      }
+      setStatusText(statusMessage);
     } catch (error) {
       setStatusText(toUserErrorMessage(error, '导入本地 PDF 失败'));
     }
@@ -999,65 +1156,117 @@ export default function App() {
     : (aiConfigStatus?.message || '请先填写 OPENAI_API_KEY');
   const aiIndicator = aiConfigStatus?.ok ? '✓' : '✕';
   const aiIndicatorClass = aiConfigStatus?.ok ? 'success' : 'error';
+  const liveStatusText = statusText || (
+    page === 'search'
+      ? `${selectedSearchSource.label} · ${showSearchLimit ? `最多 ${searchLimit} 条结果` : '直接打开目标'}`
+      : page === 'library'
+        ? `当前视图 ${visibleFavorites.length} 篇论文`
+        : page === 'history'
+          ? `最近访问 ${history.length} 条`
+          : `${tokenStatusLabel} · ${aiStatusLabel}`
+  );
 
   return (
     <div className="app-shell">
+      <div className="app-bg" aria-hidden="true">
+        <div className="app-bg-grid" />
+        <div className="app-bg-noise" />
+        <div className="app-bg-glow glow-blue" />
+        <div className="app-bg-glow glow-purple" />
+        <div className="app-bg-glow glow-teal" />
+      </div>
       <aside className="sidebar">
+        <div className="window-controls" aria-hidden="true">
+          <span className="window-dot red" />
+          <span className="window-dot yellow" />
+          <span className="window-dot green" />
+        </div>
+
         <div className="brand">
-          <h1>DeepXiv</h1>
-          <p>Mac Client</p>
+          <div className="brand-mark">DX</div>
+          <div className="brand-copy">
+            <h1>DeepXiv</h1>
+            <p>Desktop Client</p>
+          </div>
         </div>
 
         <div className="token-card">
-          <div className="token-label">Token 状态</div>
-          <div className={`token-indicator ${tokenIndicatorClass}`} title={token?.has_token ? 'Token 可用' : 'Token 未配置'}>{tokenIndicator}</div>
+          <div className="sidebar-label">账号连接</div>
+          <div className="token-card-row">
+            <div className="token-card-copy">
+              <div className="token-label">DeepXiv Token</div>
+              <div className="token-state">{tokenStatusLabel}</div>
+            </div>
+            <div className={`token-indicator ${tokenIndicatorClass}`} title={token?.has_token ? 'Token 可用' : 'Token 未配置'}>{tokenIndicator}</div>
+          </div>
+          <div className="token-value">{tokenStatusHint}</div>
         </div>
 
         <nav className="nav">
           {Object.entries(PAGE_META).map(([key, meta]) => (
-            <button key={key} className={`nav-btn ${page === key ? 'active' : ''}`} onClick={() => setPage(key)}>{meta.title}</button>
+            <button key={key} className={`nav-btn ${page === key ? 'active' : ''}`} onClick={() => setPage(key)}>
+              <span className="nav-icon" aria-hidden="true">{PAGE_DECOR[key]?.icon || '•'}</span>
+              <span className="nav-copy">
+                <span className="nav-title">{meta.title}</span>
+                <span className="nav-subtitle">{PAGE_DECOR[key]?.note || meta.subtitle}</span>
+              </span>
+            </button>
           ))}
         </nav>
+
+        <div className="card sidebar-footer">
+          <div className="sidebar-label">AI 状态</div>
+          <div className="sidebar-footer-row">
+            <div className={`token-indicator ${aiIndicatorClass}`} title={aiStatusHint}>{aiIndicator}</div>
+            <div className="sidebar-footer-copy">
+              <div className="sidebar-footer-label">{aiStatusLabel}</div>
+              <div className="sidebar-footer-meta">{aiConfig?.provider?.name || aiConfig?.modelProvider || 'fox'} · {aiConfig?.model || 'gpt-5.4'}</div>
+            </div>
+          </div>
+          <div className="sidebar-footer-hint">{aiStatusHint}</div>
+        </div>
       </aside>
 
       <main className="content">
-        <header className="topbar">
-          <div>
-            <div className="topbar-title-row">
-              <h2>{pageMeta.title}</h2>
-              {page === 'library' && (
-                <div className="topbar-inline-actions">
-                  <button className="btn primary" onClick={handleImportLocalPdf}>导入本地 PDF</button>
-                </div>
-              )}
+        {page === 'settings' ? (
+          <header className="topbar card">
+            <div className="topbar-copy">
+              <div className="topbar-title-row">
+                <h2>{pageMeta.title}</h2>
+              </div>
+              <p>{pageMeta.subtitle}</p>
             </div>
-            <p>{pageMeta.subtitle}</p>
+            <div className="topbar-status">
+              <div className={`status-pill ${statusText ? 'active' : ''}`}>{liveStatusText}</div>
+            </div>
+          </header>
+        ) : (
+          <div className="page-header-plain">
+            <div className="page-header-copy">
+              <h2>{pageMeta.title}</h2>
+              <p>{pageMeta.subtitle}</p>
+            </div>
+            <div className="page-header-status">
+              <div className={`status-pill ${statusText ? 'active' : ''}`}>{liveStatusText}</div>
+            </div>
           </div>
-          <div className="status-text">{statusText}</div>
-        </header>
+        )}
 
         {page === 'search' && (
           <section className="page active">
             <div className="toolbar card">
-              <input className="input grow" placeholder={searchPlaceholder} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && handleSearch()} />
-              <select className="select" value={searchSourceScope} onChange={(event) => setSearchSourceScope(event.target.value)}>
+              <input className="input grow search-query-input" placeholder={searchPlaceholder} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && handleSearch()} />
+              <select className="select search-source-select" value={searchSourceScope} onChange={(event) => setSearchSourceScope(event.target.value)}>
                 {SEARCH_SOURCE_OPTIONS.map((item) => (
                   <option key={item.value} value={item.value}>{item.label}</option>
                 ))}
               </select>
-              {showSearchMode && (
-                <select className="select" value={searchMode} onChange={(event) => setSearchMode(event.target.value)}>
-                  {SEARCH_MODE_OPTIONS.map((item) => (
-                    <option key={item.value} value={item.value}>{item.label}</option>
-                  ))}
-                </select>
-              )}
               {showSearchLimit && (
                 <input className="input small" type="number" min="1" max="50" value={searchLimit} onChange={(event) => setSearchLimit(event.target.value)} />
               )}
               <button className="btn primary" onClick={handleSearch}>{searchActionLabel}</button>
             </div>
-            <div className="mode-hint">{selectedSearchSource.label}：{selectedSearchSource.help} {searchSourceScope === 'mixed' ? `当前 arXiv 子检索模式为 ${selectedSearchMode.label}。` : showSearchMode ? `当前 arXiv 检索模式为 ${selectedSearchMode.label}。` : ''}</div>
+            <div className="mode-hint">{selectedSearchSource.label}：{selectedSearchSource.help}</div>
             <div className="split-layout">
               <div className="card list-panel">
                 <ResultList items={searchResults} activeId={activePaper.search?.paper_key} onSelect={(paper) => openPaper('search', paper)} emptyText="暂无结果" />
@@ -1089,42 +1298,47 @@ export default function App() {
               <div className="card list-panel">
                 <div className="favorites-shell">
                   <div className="favorite-groups-panel">
-                    <div className="favorite-groups-row">
-                      <button className={`group-chip ${activeGroupId === 'all' ? 'active' : ''}`} onClick={() => setActiveGroupId('all')}>
-                        全部
-                        <span>{favoriteGroupCounts.all || 0}</span>
-                      </button>
-                      {favoriteGroups.map((group) => (
-                        editingGroupId === group.id ? (
-                          <input
-                            key={group.id}
-                            className="input group-chip-input"
-                            autoFocus
-                            value={editingGroupName}
-                            onChange={(event) => setEditingGroupName(event.target.value)}
-                            onBlur={() => handleRenameFavoriteGroup(group.id)}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Enter') {
-                                handleRenameFavoriteGroup(group.id);
-                              }
-                              if (event.key === 'Escape') {
-                                handleCancelRenameGroup();
-                              }
-                            }}
-                          />
-                        ) : (
-                          <button
-                            key={group.id}
-                            className={`group-chip ${activeGroupId === group.id ? 'active' : ''}`}
-                            onClick={() => setActiveGroupId(group.id)}
-                            onDoubleClick={() => handleStartRenameGroup(group)}
-                          >
-                            {group.name}
-                            <span>{favoriteGroupCounts[group.id] || 0}</span>
-                          </button>
-                        )
-                      ))}
-                      <button className="btn group-create-btn" onClick={handleCreateFavoriteGroup}>{showGroupCreator ? '确认创建' : '新建分组'}</button>
+                    <div className="favorite-groups-toolbar">
+                      <div className="favorite-groups-row">
+                        <button className={`group-chip ${activeGroupId === 'all' ? 'active' : ''}`} onClick={() => setActiveGroupId('all')}>
+                          全部
+                          <span>{favoriteGroupCounts.all || 0}</span>
+                        </button>
+                        {favoriteGroups.map((group) => (
+                          editingGroupId === group.id ? (
+                            <input
+                              key={group.id}
+                              className="input group-chip-input"
+                              autoFocus
+                              value={editingGroupName}
+                              onChange={(event) => setEditingGroupName(event.target.value)}
+                              onBlur={() => handleRenameFavoriteGroup(group.id)}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter') {
+                                  handleRenameFavoriteGroup(group.id);
+                                }
+                                if (event.key === 'Escape') {
+                                  handleCancelRenameGroup();
+                                }
+                              }}
+                            />
+                          ) : (
+                            <button
+                              key={group.id}
+                              className={`group-chip ${activeGroupId === group.id ? 'active' : ''}`}
+                              onClick={() => setActiveGroupId(group.id)}
+                              onDoubleClick={() => handleStartRenameGroup(group)}
+                            >
+                              {group.name}
+                              <span>{favoriteGroupCounts[group.id] || 0}</span>
+                            </button>
+                          )
+                        ))}
+                      </div>
+                      <div className="favorite-groups-actions">
+                        <button className="btn primary import-pdf-btn" onClick={handleImportLocalPdf}>批量导入 PDF</button>
+                        <button className="btn group-create-btn" onClick={handleCreateFavoriteGroup}>{showGroupCreator ? '确认创建' : '新建分组'}</button>
+                      </div>
                     </div>
                     {showGroupCreator && (
                       <div className="favorite-group-editor">
@@ -1305,7 +1519,6 @@ export default function App() {
                   </label>
                 </div>
 
-                <div className="settings-status-hint multiline">论文详情主体区域会直接显示 AI 论文助手；发送问题时会默认把当前论文 PDF 作为上下文优先传入，找不到 PDF 时会回退为标题与摘要上下文。</div>
                 <div className="btn-row">
                   <button className="btn primary" onClick={handleSaveAiConfig}>保存 AI 配置</button>
                   <button className="btn" onClick={handleResetAiConfig}>恢复默认</button>
