@@ -137,7 +137,7 @@ jobs:
           APP_DIR="$(dirname "$APP_PATH")"
           APP_NAME="$(basename "$APP_PATH" .app)"
           APP_VERSION="$(node -p "require('./package.json').version")"
-          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$APP_DIR/${APP_NAME}-${APP_VERSION}-arm64.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "release/${APP_NAME}-${APP_VERSION}-arm64.app.zip"
 
       - name: Upload packaged artifacts
         if: startsWith(github.ref, 'refs/tags/')
