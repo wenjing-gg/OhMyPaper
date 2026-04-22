@@ -50,6 +50,34 @@ function normalizePdfDocumentSource(result) {
   return null;
 }
 
+function buildViewerAttachmentState(viewer, result = null) {
+  const source = result || viewer?.payload || {};
+  const target = String(
+    result?.openTarget
+    || result?.target
+    || viewer?.target
+    || source?.target
+    || source?.local_pdf_path
+    || ''
+  ).trim();
+  const sourceUrl = String(source?.sourceUrl || source?.source_url || source?.pdf_url || '').trim();
+  const localPath = String(
+    source?.localPath
+    || source?.local_path
+    || source?.local_pdf_path
+    || (!/^https?:\/\//i.test(target) ? target : '')
+    || ''
+  ).trim();
+  return {
+    sourceUrl,
+    localPath,
+    attachMode: String(source?.attachMode || source?.attach_mode || '').trim(),
+    aiAttachable: source?.aiAttachable !== false,
+    aiAttachmentMessage: String(source?.aiAttachmentMessage || source?.ai_attachment_message || '').trim(),
+    isLocal: source?.isLocal === true || Boolean(localPath),
+  };
+}
+
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
@@ -246,6 +274,12 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
       message: String(nextState.message || '').trim(),
       error: String(nextState.error || '').trim(),
       hasLoaded: nextState.hasLoaded === true,
+      sourceUrl: String(nextState.sourceUrl || nextState.source_url || '').trim(),
+      localPath: String(nextState.localPath || nextState.local_path || '').trim(),
+      attachMode: String(nextState.attachMode || nextState.attach_mode || '').trim(),
+      aiAttachable: nextState.aiAttachable !== false,
+      aiAttachmentMessage: String(nextState.aiAttachmentMessage || nextState.ai_attachment_message || '').trim(),
+      isLocal: nextState.isLocal === true,
     };
     const signature = JSON.stringify(normalized);
     if (
@@ -316,6 +350,7 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
       requestId,
       state: 'loading',
       message: loadingMessage,
+      ...buildViewerAttachmentState(viewer),
     });
 
     (async () => {
@@ -355,6 +390,7 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
         state: 'loaded',
         hasLoaded: true,
         message: 'PDF 已成功加载',
+        ...buildViewerAttachmentState(viewer, result),
       });
     })().catch(async (error) => {
       if (cancelled) return;
@@ -374,6 +410,7 @@ export default function PdfReaderPane({ viewer, onClose, pdfStatus, onLoadDocume
         state: 'error',
         error: message,
         message,
+        ...buildViewerAttachmentState(viewer),
       });
     });
 

@@ -496,6 +496,12 @@ function normalizePdfViewerState(raw) {
     message: String(next.message || '').trim(),
     error: String(next.error || '').trim(),
     hasLoaded: next.hasLoaded === true || state === 'loaded',
+    sourceUrl: String(next.sourceUrl || next.source_url || '').trim(),
+    localPath: String(next.localPath || next.local_path || '').trim(),
+    attachMode: String(next.attachMode || next.attach_mode || '').trim(),
+    aiAttachable: next.aiAttachable === false ? false : (next.aiAttachable === true ? true : null),
+    aiAttachmentMessage: String(next.aiAttachmentMessage || next.ai_attachment_message || '').trim(),
+    isLocal: next.isLocal === true,
   };
 }
 
@@ -782,10 +788,61 @@ function buildAiPaperContext(snapshot, rawPaper, pdfStatus = null) {
     publishAt: brief.publish_at || head.publish_at || paper.publish_at || '',
     sourceUrl: head.src_url || brief.src_url || paper.external_url || '',
     pdfUrl: resolvePdfUrl(snapshot, paper),
+    localPdfPath: resolveLocalPdfPath(snapshot, paper),
     contextText: String(head.full_context_text || paper.full_context_text || '').trim(),
     resolvedFromSibling: pdfStatus?.resolvedFromSibling === true,
     pdfSourceKind: String(pdfStatus?.resolvedSourceKind || '').trim(),
     pdfSourceLabel: String(pdfStatus?.resolvedSourceLabel || '').trim(),
+  };
+}
+
+function resolveAiPdfAttachment(snapshot, rawPaper, pdfStatus, pdfViewerState, embeddedPdf) {
+  const paperContext = buildAiPaperContext(snapshot, rawPaper, pdfStatus);
+  const viewerPayload = embeddedPdf?.payload || {};
+  const viewerTarget = String(embeddedPdf?.target || '').trim();
+  const pdfLoaded = pdfViewerState?.hasLoaded === true;
+  const remotePdfUrl = [
+    viewerPayload.pdf_url,
+    pdfViewerState?.sourceUrl,
+    pdfStatus?.sourceUrl,
+    paperContext.pdfUrl,
+  ]
+    .map((value) => String(value || '').trim())
+    .find((value) => isRemoteHttpUrl(value) && looksLikePdfUrl(value)) || '';
+  const localPdfPath = [
+    viewerPayload.local_pdf_path,
+    (!isRemoteHttpUrl(viewerTarget) ? viewerTarget : ''),
+    pdfViewerState?.localPath,
+    paperContext.localPdfPath,
+  ]
+    .map((value) => String(value || '').trim())
+    .find(Boolean) || '';
+  const requestedAttachMode = String(pdfViewerState?.attachMode || '').trim();
+  const aiAttachable = pdfViewerState?.aiAttachable !== false;
+
+  let attachMode = 'none';
+  if (
+    pdfLoaded
+    && aiAttachable
+    && (requestedAttachMode === 'file_data' || !requestedAttachMode)
+    && (localPdfPath || remotePdfUrl)
+  ) {
+    attachMode = 'file_data';
+  }
+
+  const blockedMessage = pdfLoaded && attachMode === 'none'
+    ? (String(pdfViewerState?.aiAttachmentMessage || '').trim() || 'PDF 已打开，但当前未附带原文，仅使用标题/摘要/摘录上下文')
+    : '';
+
+  return {
+    paperContext,
+    pdfLoaded,
+    hasTextContext: Boolean(paperContext.contextText),
+    remotePdfUrl,
+    localPdfPath,
+    attachMode,
+    aiAttachable,
+    blockedMessage,
   };
 }
 
@@ -931,28 +988,35 @@ function HistoryList({ items, activeKey, onSelect, emptyText }) {
   );
 }
 
-function AIChatPanel({ snapshot, paper, pdfStatus, pdfViewerState, aiConfig, aiConfigStatus, onAskAI, messages = [], onMessagesChange }) {
+function AIChatPanel({ snapshot, paper, pdfStatus, pdfViewerState, embeddedPdf, aiConfig, aiConfigStatus, onAskAI, messages = [], onMessagesChange }) {
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(false);
   const snapshotKey = snapshot?.arxiv_id || snapshot?.openalex_id || snapshot?.europepmc_id || paper?.paper_key || paper?.title || '';
-  const paperContext = useMemo(() => buildAiPaperContext(snapshot, paper, pdfStatus), [snapshot, paper, pdfStatus, snapshotKey]);
+  const pdfAttachment = useMemo(
+    () => resolveAiPdfAttachment(snapshot, paper, pdfStatus, pdfViewerState, embeddedPdf),
+    [snapshot, paper, pdfStatus, pdfViewerState, embeddedPdf, snapshotKey],
+  );
+  const paperContext = pdfAttachment.paperContext;
   const needsAuth = aiConfig?.provider?.requiresOpenAIAuth !== false;
   const hasApiKey = Boolean(aiConfig?.openAIApiKey);
   const validated = !needsAuth || aiConfigStatus?.ok === true;
   const ready = !needsAuth ? true : hasApiKey && validated;
-  const hasTextContext = Boolean(paperContext.contextText);
-  const candidatePdfUrl = String(pdfStatus?.sourceUrl || paperContext.pdfUrl || '').trim();
-  const hasPdfContext = pdfViewerState?.hasLoaded === true && isRemoteHttpUrl(candidatePdfUrl) && looksLikePdfUrl(candidatePdfUrl);
+  const hasTextContext = pdfAttachment.hasTextContext;
+  const hasPdfContext = pdfAttachment.attachMode !== 'none';
   const effectivePaperContext = useMemo(() => ({
     ...paperContext,
     pdfLoaded: hasPdfContext,
-    pdfUrl: hasPdfContext ? candidatePdfUrl : '',
-  }), [paperContext, hasPdfContext, candidatePdfUrl]);
+    attachMode: pdfAttachment.attachMode,
+    pdfUrl: hasPdfContext ? pdfAttachment.remotePdfUrl : '',
+    localPdfPath: hasPdfContext ? pdfAttachment.localPdfPath : '',
+  }), [paperContext, hasPdfContext, pdfAttachment]);
   const readinessHint = !hasApiKey
     ? '请先在设置中填写 OPENAI_API_KEY'
     : (aiConfigStatus?.message || '请先在设置页保存并验证 AI 配置');
-  const contextStatus = hasPdfContext
+  const contextStatus = pdfAttachment.attachMode === 'file_data'
     ? (paperContext.resolvedFromSibling ? `已附带开放兄弟版本 PDF 上下文${paperContext.pdfSourceLabel ? `（${paperContext.pdfSourceLabel}）` : ''}` : '已附带 PDF 原文上下文')
+    : pdfAttachment.blockedMessage
+      ? pdfAttachment.blockedMessage
     : hasTextContext
       ? '已附带论文正文摘录上下文'
       : '未附带 PDF 原文，仅使用标题与摘要上下文';
@@ -1133,6 +1197,7 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
             paper={paper}
             pdfStatus={pdfStatus}
             pdfViewerState={pdfViewerState}
+            embeddedPdf={embeddedPdf}
             aiConfig={aiConfig}
             aiConfigStatus={aiConfigStatus}
             onAskAI={onAskAI}
@@ -1544,6 +1609,12 @@ export default function App() {
         && current.message === merged.message
         && current.error === merged.error
         && current.hasLoaded === merged.hasLoaded
+        && current.sourceUrl === merged.sourceUrl
+        && current.localPath === merged.localPath
+        && current.attachMode === merged.attachMode
+        && current.aiAttachable === merged.aiAttachable
+        && current.aiAttachmentMessage === merged.aiAttachmentMessage
+        && current.isLocal === merged.isLocal
       ) {
         return prev;
       }

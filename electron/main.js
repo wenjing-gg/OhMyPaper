@@ -756,6 +756,178 @@ async function validatePdfFilePath(filePath) {
   }
 }
 
+async function resolveAiPdfAttachmentDescriptor({ sourceUrl = '', localPath = '', isLocal = false } = {}) {
+  const remoteSourceUrl = String(sourceUrl || '').trim();
+  const candidateLocalPath = String(localPath || '').trim();
+  const localFlag = isLocal === true || Boolean(candidateLocalPath);
+  const hasRemotePdf = isRemoteHttpUrl(remoteSourceUrl) && looksLikePdfUrl(remoteSourceUrl);
+
+  if (candidateLocalPath) {
+    const valid = await validatePdfFilePath(candidateLocalPath);
+    if (valid) {
+      return {
+        sourceUrl: remoteSourceUrl,
+        localPath: candidateLocalPath,
+        attachMode: 'file_data',
+        aiAttachable: true,
+        aiAttachmentMessage: '',
+        isLocal: true,
+      };
+    }
+    if (!hasRemotePdf) {
+      return {
+        sourceUrl: remoteSourceUrl,
+        localPath: candidateLocalPath,
+        attachMode: 'none',
+        aiAttachable: false,
+        aiAttachmentMessage: 'PDF 已打开，但本地文件无效，当前未附带原文',
+        isLocal: true,
+      };
+    }
+  }
+
+  if (hasRemotePdf) {
+    return {
+      sourceUrl: remoteSourceUrl,
+      localPath: candidateLocalPath,
+      attachMode: 'file_data',
+      aiAttachable: true,
+      aiAttachmentMessage: '',
+      isLocal: localFlag,
+    };
+  }
+
+  return {
+    sourceUrl: remoteSourceUrl,
+    localPath: '',
+    attachMode: 'none',
+    aiAttachable: false,
+    aiAttachmentMessage: 'PDF 已打开，但当前未附带可供 AI 使用的原文文件',
+    isLocal: localFlag,
+  };
+}
+
+async function cacheRemotePdfForAi(remotePdfUrl = '') {
+  const normalizedUrl = String(remotePdfUrl || '').trim();
+  if (!isRemoteHttpUrl(normalizedUrl) || !looksLikePdfUrl(normalizedUrl)) {
+    throw new Error('未找到可缓存的远程 PDF 地址');
+  }
+
+  await fsp.mkdir(pdfCacheDir(), { recursive: true });
+  const cachePath = path.join(pdfCacheDir(), `${sha1(`ai-file-data|${normalizedUrl}`)}.pdf`);
+  if (await fileExists(cachePath)) {
+    const valid = await validatePdfFilePath(cachePath);
+    if (valid) {
+      return cachePath;
+    }
+    await fsp.rm(cachePath, { force: true }).catch(() => {});
+  }
+
+  const candidate = normalizePdfCandidate({ url: normalizedUrl }, 'direct_pdf') || {
+    url: normalizedUrl,
+    kind: 'direct_pdf',
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PDF_FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(normalizedUrl, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: pdfFetchHeaders(candidate),
+    });
+    if (!response.ok) {
+      throw new Error(`远程 PDF 下载失败（HTTP ${response.status}）`);
+    }
+
+    const reader = response.body?.getReader ? response.body.getReader() : null;
+    let firstChunk = Buffer.alloc(0);
+    let bodyBuffer = null;
+
+    if (reader) {
+      const first = await reader.read();
+      if (!first.done) {
+        firstChunk = Buffer.from(first.value);
+      }
+    } else {
+      bodyBuffer = Buffer.from(await response.arrayBuffer());
+      firstChunk = bodyBuffer.subarray(0, Math.min(bodyBuffer.length, 1024));
+    }
+
+    if (!validatePdfSignature(firstChunk, response, { sourceUrl: normalizedUrl, target: normalizedUrl })) {
+      const classification = classifyInvalidPdfResponse(firstChunk, response, { sourceUrl: normalizedUrl, target: normalizedUrl }, candidate);
+      throw new Error(classification?.message || '远程源站返回的内容不是有效 PDF');
+    }
+
+    await streamPdfToTempPath({
+      tempPath: cachePath,
+      response,
+      reader,
+      firstChunk,
+      bodyBuffer,
+      initialStatus: { openTarget: normalizedUrl, message: '正在缓存 PDF…' },
+      candidate,
+      emitIfCurrent: () => {},
+      ensureCurrentTask: () => {},
+    });
+
+    const valid = await validatePdfFilePath(cachePath);
+    if (!valid) {
+      throw new Error('缓存后的 PDF 文件无效');
+    }
+    return cachePath;
+  } catch (error) {
+    await fsp.rm(cachePath, { force: true }).catch(() => {});
+    if (error?.name === 'AbortError') {
+      throw new Error('远程 PDF 下载超时');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function buildAiInputFileAttachment(paperContext = {}) {
+  if (paperContext?.pdfLoaded !== true) {
+    return { inputFile: null, attachMode: 'none' };
+  }
+
+  const remotePdfUrl = String(paperContext.pdfUrl || '').trim();
+  const localPdfPath = String(paperContext.localPdfPath || '').trim();
+  const descriptor = await resolveAiPdfAttachmentDescriptor({
+    sourceUrl: remotePdfUrl,
+    localPath: localPdfPath,
+    isLocal: Boolean(localPdfPath),
+  });
+
+  if (descriptor.attachMode !== 'file_data') {
+    return {
+      inputFile: null,
+      attachMode: 'none',
+      aiAttachmentMessage: descriptor.aiAttachmentMessage,
+    };
+  }
+
+  try {
+    const filePath = descriptor.localPath || await cacheRemotePdfForAi(descriptor.sourceUrl);
+    const buffer = await fsp.readFile(filePath);
+    return {
+      inputFile: {
+        type: 'input_file',
+        filename: path.basename(filePath) || 'paper.pdf',
+        file_data: `data:application/pdf;base64,${buffer.toString('base64')}`,
+      },
+      attachMode: 'file_data',
+    };
+  } catch (error) {
+    return {
+      inputFile: null,
+      attachMode: 'none',
+      aiAttachmentMessage: String(error?.message || error || 'PDF 读取失败，当前未附带原文').trim() || 'PDF 读取失败，当前未附带原文',
+    };
+  }
+}
+
 async function getCachedPdfStatus(normalized) {
   if (!normalized?.paperKey) {
     return null;
@@ -2553,14 +2725,26 @@ async function loadPdfDocument(payload = {}) {
     throw new Error('无法创建 PDF 读取地址');
   }
 
+  const sourceUrl = String(readyStatus?.sourceUrl || normalized.sourceUrl || '').trim();
+  const localPath = String(openTarget || normalized.localPath || '').trim();
+  const aiAttachment = await resolveAiPdfAttachmentDescriptor({
+    sourceUrl,
+    localPath,
+    isLocal: readyStatus?.isLocal === true || Boolean(normalized.localPath),
+  });
+
   return {
     paperKey: normalized.paperKey,
     title: normalized.title,
     openTarget,
     documentUrl,
-    sourceUrl: String(readyStatus?.sourceUrl || normalized.sourceUrl || '').trim(),
+    sourceUrl: aiAttachment.sourceUrl,
+    localPath: aiAttachment.localPath,
+    attachMode: aiAttachment.attachMode,
+    aiAttachable: aiAttachment.aiAttachable,
+    aiAttachmentMessage: aiAttachment.aiAttachmentMessage,
     isCached: readyStatus?.isCached === true,
-    isLocal: readyStatus?.isLocal === true || Boolean(normalized.localPath),
+    isLocal: aiAttachment.isLocal,
   };
 }
 
@@ -3301,11 +3485,12 @@ async function callAi(payload = {}) {
   const paperContext = payload.paperContext || {};
   const history = Array.isArray(payload.messages) ? payload.messages : [];
   const input = [];
-  const hasRemotePdfContext = paperContext.pdfLoaded === true && isRemoteHttpUrl(paperContext.pdfUrl) && looksLikePdfUrl(paperContext.pdfUrl);
   const hasTextContext = Boolean(String(paperContext.contextText || '').trim());
   const contextContent = [{ type: 'input_text', text: buildPaperContextText(paperContext) }];
-  if (hasRemotePdfContext) {
-    contextContent.push({ type: 'input_file', file_url: paperContext.pdfUrl });
+  const pdfAttachment = await buildAiInputFileAttachment(paperContext);
+  const hasPdfContext = Boolean(pdfAttachment.inputFile);
+  if (pdfAttachment.inputFile) {
+    contextContent.push(pdfAttachment.inputFile);
   }
   input.push({ role: 'user', content: contextContent });
 
@@ -3357,8 +3542,8 @@ async function callAi(payload = {}) {
     answer: extractResponseText(data),
     reasoningSummary: reasoning.summaryText,
     reasoningSteps: reasoning.steps,
-    usedPdfContext: Boolean(hasRemotePdfContext || hasTextContext),
-    contextMode: hasRemotePdfContext ? 'pdf' : hasTextContext ? 'text' : 'metadata',
+    usedPdfContext: Boolean(hasPdfContext || hasTextContext),
+    contextMode: hasPdfContext ? 'pdf' : hasTextContext ? 'text' : 'metadata',
     providerName: aiConfig.provider.name || aiConfig.modelProvider,
     model: aiConfig.model,
   };
