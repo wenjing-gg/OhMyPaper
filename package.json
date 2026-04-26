@@ -1,6 +1,6 @@
 {
   "name": "deepxiv-client",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "DeepXiv cross-platform desktop client built with Electron and the official Python SDK",
   "author": "wenjing-gg",
   "repository": {
@@ -15,6 +15,7 @@
     "renderer:dev": "vite --config renderer/vite.config.js",
     "renderer:build": "vite build --config renderer/vite.config.js",
     "bridge:build": "node scripts/build_bridge.js",
+    "test:ai-network": "node scripts/test_ai_network.js",
     "build:mac": "npm run bridge:build && npm run renderer:build && electron-builder --mac dir",
     "dist:mac": "npm run bridge:build && npm run renderer:build && electron-builder --mac dmg --publish never",
     "build:win": "npm run bridge:build && npm run renderer:build && electron-builder --win dir --x64",

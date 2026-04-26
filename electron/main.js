@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, protocol } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, protocol, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -6,6 +6,7 @@ const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
 const { Readable } = require('stream');
 const { pathToFileURL } = require('url');
+const { createAiNetworkHelpers, parseJsonResponse } = require('./ai_network');
 
 const DEFAULT_AI_CONFIG = {
   modelProvider: 'fox',
@@ -831,7 +832,7 @@ async function cacheRemotePdfForAi(remotePdfUrl = '') {
   const timer = setTimeout(() => controller.abort(), PDF_FETCH_TIMEOUT_MS);
 
   try {
-    const response = await fetch(normalizedUrl, {
+    const response = await fetchWithAppSession(normalizedUrl, {
       redirect: 'follow',
       signal: controller.signal,
       headers: pdfFetchHeaders(candidate),
@@ -1662,6 +1663,27 @@ async function sessionFetchWithFallback(ses, url, options = {}) {
   }
   return fetch(url, options);
 }
+
+function getAppNetworkSession() {
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      return mainWindow.webContents.session || null;
+    }
+  } catch (error) {
+  }
+  try {
+    return session.defaultSession || null;
+  } catch (error) {
+  }
+  return null;
+}
+
+const { fetchWithAppSession, postResponsesRequest } = createAiNetworkHelpers({
+  getSession: getAppNetworkSession,
+  fallbackFetch: (...args) => fetch(...args),
+  normalizeBaseUrl,
+  formatAiConnectivityError,
+});
 
 async function waitForBrowserResolutionSettled(webContents, timeoutMs = PDF_BROWSER_RESOLUTION_TIMEOUT_MS) {
   const startedAt = Date.now();
@@ -2986,116 +3008,80 @@ function extractReasoningArtifacts(payload) {
   };
 }
 
-function parseSsePayload(rawText) {
-  const blocks = String(rawText || '').split('\n\n');
-  const deltas = [];
-  const reasoningDeltas = [];
-  const reasoningSummaryDeltas = [];
-  const reasoningEvents = [];
-  let completedPayload = null;
-  let errorMessage = '';
+function extractNetworkErrorCode(error) {
+  const directCodes = [
+    error?.cause?.code,
+    error?.code,
+    error?.cause?.errno,
+    error?.errno,
+  ];
 
-  for (const block of blocks) {
-    const trimmed = block.trim();
-    if (!trimmed) continue;
-    const dataLines = trimmed
-      .split('\n')
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trim());
-    const payloadText = dataLines.join('\n');
-    if (!payloadText || payloadText === '[DONE]') continue;
-
-    let payload;
-    try {
-      payload = JSON.parse(payloadText);
-    } catch (error) {
-      continue;
-    }
-
-    if (payload?.error?.message) {
-      errorMessage = payload.error.message;
-    }
-    const payloadType = String(payload?.type || '').toLowerCase();
-    if (payload?.type === 'response.output_text.delta' && typeof payload.delta === 'string') {
-      deltas.push(payload.delta);
-    }
-    if (typeof payload?.delta === 'string' && /reasoning.*summary.*delta/i.test(payloadType)) {
-      reasoningSummaryDeltas.push(payload.delta);
-    }
-    if (typeof payload?.delta === 'string' && /reasoning(?!.*summary).*delta/i.test(payloadType)) {
-      reasoningDeltas.push(payload.delta);
-    }
-    if (payloadType.includes('reasoning') || String(payload?.item?.type || '').toLowerCase().includes('reasoning')) {
-      reasoningEvents.push(payload.item || payload);
-    }
-    if (payload?.type === 'response.completed') {
-      completedPayload = payload.response || payload;
+  for (const rawCode of directCodes) {
+    const code = String(rawCode || '').trim().toUpperCase();
+    if (code) {
+      return code;
     }
   }
 
-  if (errorMessage) {
-    throw new Error(errorMessage);
+  const messageCandidates = [
+    error?.cause?.message,
+    error?.message,
+    error?.stack,
+    String(error || ''),
+  ];
+
+  for (const rawMessage of messageCandidates) {
+    const message = String(rawMessage || '').trim().toUpperCase();
+    if (!message) continue;
+
+    const chromiumMatch = message.match(/ERR_[A-Z0-9_]+/);
+    if (chromiumMatch?.[0]) {
+      return chromiumMatch[0];
+    }
+
+    const certMatch = message.match(/\bCERT_[A-Z0-9_]+\b/);
+    if (certMatch?.[0]) {
+      return certMatch[0];
+    }
+
+    const nodeMatch = message.match(/\b(?:ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH)\b/);
+    if (nodeMatch?.[0]) {
+      return nodeMatch[0];
+    }
   }
 
-  const text = deltas.join('').trim();
-  const reasoningText = reasoningDeltas.join('').trim();
-  const reasoningSummaryText = reasoningSummaryDeltas.join('').trim();
-  if (text) {
-    return {
-      output_text: text,
-      output: completedPayload?.output || [],
-      reasoning_text: reasoningText,
-      reasoning_summary_text: reasoningSummaryText,
-      reasoning_events: reasoningEvents,
-    };
-  }
-
-  if (completedPayload) {
-    return {
-      ...completedPayload,
-      ...(reasoningText ? { reasoning_text: reasoningText } : {}),
-      ...(reasoningSummaryText ? { reasoning_summary_text: reasoningSummaryText } : {}),
-      ...(reasoningEvents.length ? { reasoning_events: reasoningEvents } : {}),
-    };
-  }
-
-  throw new Error('AI 返回了空的流式响应');
-}
-
-async function parseJsonResponse(response) {
-  const text = await response.text();
-  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-  if (contentType.includes('text/event-stream')) {
-    return parseSsePayload(text);
-  }
-  try {
-    return text ? JSON.parse(text) : {};
-  } catch (error) {
-    return { rawText: text };
-  }
+  return '';
 }
 
 function formatAiConnectivityError(baseUrl, error) {
   const rawMessage = String(error?.message || '').trim();
-  const cause = error?.cause;
-  const causeCode = String(cause?.code || '').trim().toUpperCase();
+  const causeCode = extractNetworkErrorCode(error);
   let host = normalizeBaseUrl(baseUrl);
   try {
     host = new URL(baseUrl).host || host;
   } catch (parseError) {
   }
 
-  if (causeCode === 'ENOTFOUND') {
+  if (causeCode === 'ENOTFOUND' || causeCode === 'EAI_AGAIN' || causeCode === 'ERR_NAME_NOT_RESOLVED') {
     return `无法解析 AI 服务地址 ${host}`;
   }
-  if (causeCode === 'ECONNRESET') {
+  if (causeCode === 'ERR_PROXY_CONNECTION_FAILED') {
+    return `AI 服务代理连接失败：${host}`;
+  }
+  if (causeCode.startsWith('CERT_') || causeCode.startsWith('ERR_CERT_')) {
+    return `AI 服务证书校验失败：${host}`;
+  }
+  if (causeCode === 'ECONNRESET' || causeCode === 'ERR_CONNECTION_RESET') {
     return `AI 服务连接被重置，请检查 ${host} 是否可访问`;
   }
-  if (causeCode === 'ECONNREFUSED') {
+  if (causeCode === 'ECONNREFUSED' || causeCode === 'ERR_CONNECTION_REFUSED') {
     return `AI 服务拒绝连接：${host}`;
   }
-  if (causeCode === 'ETIMEDOUT') {
+  if (causeCode === 'ETIMEDOUT' || causeCode === 'ERR_TIMED_OUT' || causeCode === 'ERR_CONNECTION_TIMED_OUT') {
     return `连接 AI 服务超时：${host}`;
+  }
+  if (causeCode === 'EHOSTUNREACH' || causeCode === 'ENETUNREACH' || causeCode === 'ERR_INTERNET_DISCONNECTED') {
+    return `当前网络不可用，无法连接 AI 服务：${host}`;
   }
   if (rawMessage === 'fetch failed' && host) {
     return `无法连接到 AI 服务：${host}`;
@@ -3401,26 +3387,14 @@ async function probeAiConfig(rawConfig = {}) {
     }, aiConfig);
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
-
   try {
-    const response = await fetch(`${normalizeBaseUrl(aiConfig.provider.baseUrl)}/responses`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(aiConfig.provider.requiresOpenAIAuth ? { Authorization: `Bearer ${aiConfig.openAIApiKey}` } : {}),
-      },
-      body: JSON.stringify({
+    const { response, data } = await postResponsesRequest(aiConfig, {
         model: aiConfig.model,
         store: false,
         reasoning: { effort: 'minimal' },
         instructions: 'Reply with OK only.',
         input: [{ role: 'user', content: [{ type: 'input_text', text: 'ping' }] }],
-      }),
-      signal: controller.signal,
-    });
-    const data = await parseJsonResponse(response);
+      }, 20000);
     if (!response.ok) {
       const message = data?.error?.message || data?.message || data?.rawText || `AI 请求失败（HTTP ${response.status}）`;
       return normalizeAiConfigStatus({
@@ -3447,12 +3421,10 @@ async function probeAiConfig(rawConfig = {}) {
     }
     return normalizeAiConfigStatus({
       ok: false,
-      code: String(error?.cause?.code || 'network_error').trim().toLowerCase() || 'network_error',
+      code: String(extractNetworkErrorCode(error) || 'network_error').trim().toLowerCase() || 'network_error',
       message: formatAiConnectivityError(aiConfig.provider.baseUrl, error),
       checkedAt,
     }, aiConfig);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -3502,51 +3474,37 @@ async function callAi(payload = {}) {
   }
   input.push({ role: 'user', content: [{ type: 'input_text', text: prompt }] });
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 120000);
-  let response;
   try {
-    response = await fetch(`${normalizeBaseUrl(aiConfig.provider.baseUrl)}/responses`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(aiConfig.provider.requiresOpenAIAuth ? { Authorization: `Bearer ${aiConfig.openAIApiKey}` } : {}),
-      },
-      body: JSON.stringify({
+    const { response, data } = await postResponsesRequest(aiConfig, {
         model: aiConfig.model,
         store: !aiConfig.disableResponseStorage,
         reasoning: { effort: aiConfig.modelReasoningEffort },
         instructions: 'You are DeepXiv 的论文阅读助手。默认使用中文回答，优先依据随附 PDF 内容，其次参考论文元信息。回答应准确、简洁，并在不确定时明确说明。',
         input,
-      }),
-      signal: controller.signal,
-    });
+      }, 120000);
+
+    if (!response.ok) {
+      const message = data?.error?.message || data?.message || data?.rawText || `AI 请求失败（HTTP ${response.status}）`;
+      throw new Error(message);
+    }
+
+    const reasoning = extractReasoningArtifacts(data);
+
+    return {
+      answer: extractResponseText(data),
+      reasoningSummary: reasoning.summaryText,
+      reasoningSteps: reasoning.steps,
+      usedPdfContext: Boolean(hasPdfContext || hasTextContext),
+      contextMode: hasPdfContext ? 'pdf' : hasTextContext ? 'text' : 'metadata',
+      providerName: aiConfig.provider.name || aiConfig.modelProvider,
+      model: aiConfig.model,
+    };
   } catch (error) {
     if (error?.name === 'AbortError') {
       throw new Error('AI 请求超时，请稍后重试');
     }
     throw new Error(formatAiConnectivityError(aiConfig.provider.baseUrl, error));
-  } finally {
-    clearTimeout(timer);
   }
-
-  const data = await parseJsonResponse(response);
-  if (!response.ok) {
-    const message = data?.error?.message || data?.message || data?.rawText || `AI 请求失败（HTTP ${response.status}）`;
-    throw new Error(message);
-  }
-
-  const reasoning = extractReasoningArtifacts(data);
-
-  return {
-    answer: extractResponseText(data),
-    reasoningSummary: reasoning.summaryText,
-    reasoningSteps: reasoning.steps,
-    usedPdfContext: Boolean(hasPdfContext || hasTextContext),
-    contextMode: hasPdfContext ? 'pdf' : hasTextContext ? 'text' : 'metadata',
-    providerName: aiConfig.provider.name || aiConfig.modelProvider,
-    model: aiConfig.model,
-  };
 }
 
 async function importLocalPdf(options = {}) {
