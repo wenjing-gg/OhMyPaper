@@ -16,6 +16,10 @@ function fail(message) {
   process.exit(1);
 }
 
+function warn(message) {
+  console.warn(message);
+}
+
 function prepareAppleApiKeyFile() {
   if (!hasValue('APPLE_API_KEY_B64')) {
     return;
@@ -41,6 +45,24 @@ function hasNotarizationAuth() {
   return hasApiKeyAuth || hasAppleIdAuth || hasKeychainAuth;
 }
 
+function hasAnyNotarizationSecret() {
+  return [
+    'APPLE_API_KEY',
+    'APPLE_API_KEY_B64',
+    'APPLE_API_KEY_ID',
+    'APPLE_API_ISSUER',
+    'APPLE_ID',
+    'APPLE_APP_SPECIFIC_PASSWORD',
+    'APPLE_TEAM_ID',
+    'APPLE_KEYCHAIN_PROFILE',
+  ].some(hasValue);
+}
+
+function disableCodeSigningAutoDiscovery() {
+  process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
+  appendGithubEnv('CSC_IDENTITY_AUTO_DISCOVERY', 'false');
+}
+
 function main() {
   if (process.platform !== 'darwin') {
     return;
@@ -53,12 +75,23 @@ function main() {
     return;
   }
 
-  if (!hasValue('CSC_LINK') || !hasValue('CSC_KEY_PASSWORD')) {
-    fail('Missing macOS signing certificate secrets: CSC_LINK and CSC_KEY_PASSWORD are required.');
+  const hasSigningCert = hasValue('CSC_LINK') && hasValue('CSC_KEY_PASSWORD');
+  const hasPartialSigningCert = hasValue('CSC_LINK') || hasValue('CSC_KEY_PASSWORD');
+  if (hasPartialSigningCert && !hasSigningCert) {
+    fail('Partial macOS signing certificate configuration: both CSC_LINK and CSC_KEY_PASSWORD are required.');
+  }
+
+  if (!hasSigningCert) {
+    disableCodeSigningAutoDiscovery();
+    warn('Missing macOS signing certificate secrets. Falling back to unsigned/ad-hoc macOS packaging.');
+    return;
   }
 
   if (!hasNotarizationAuth()) {
-    fail('Missing Apple notarization credentials. Provide APPLE_API_KEY_B64 + APPLE_API_KEY_ID + APPLE_API_ISSUER, or APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID.');
+    if (hasAnyNotarizationSecret()) {
+      fail('Partial Apple notarization configuration. Provide APPLE_API_KEY_B64 + APPLE_API_KEY_ID + APPLE_API_ISSUER, or APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID.');
+    }
+    warn('Missing Apple notarization credentials. The app will be packaged without notarization.');
   }
 
   console.log('macOS signing and notarization environment is ready.');
