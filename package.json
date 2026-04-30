@@ -1,6 +1,6 @@
 {
   "name": "ohmypaper",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "OhMyPaper cross-platform desktop client built with Electron and the DeepXiv official Python SDK",
   "author": "wenjing-gg",
   "repository": {
