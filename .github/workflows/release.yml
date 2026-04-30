@@ -137,7 +137,25 @@ jobs:
           .\bridge-dist\ohmypaper-bridge.exe save-token '{"token":"ci-bundled-token"}'
           .\bridge-dist\ohmypaper-bridge.exe token-status '{}'
 
-      - name: Build release package
+      - name: Build release package (macOS signed)
+        if: runner.os == 'macOS' && env.MAC_SIGNING_MODE != 'unsigned'
+        shell: bash
+        run: npm run ${{ matrix.npm_script }}
+
+      - name: Build release package (macOS unsigned fallback)
+        if: runner.os == 'macOS' && env.MAC_SIGNING_MODE == 'unsigned'
+        shell: bash
+        run: |
+          npm run bridge:build
+          npm run renderer:build
+          npx electron-builder --mac dmg --publish never \
+            -c.mac.identity=null \
+            -c.mac.notarize=false \
+            -c.mac.hardenedRuntime=false
+
+      - name: Build release package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: npm run ${{ matrix.npm_script }}
 
       - name: Package macOS app bundle

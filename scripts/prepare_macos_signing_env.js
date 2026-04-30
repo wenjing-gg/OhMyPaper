@@ -61,6 +61,7 @@ function hasAnyNotarizationSecret() {
 function disableCodeSigningAutoDiscovery() {
   process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
   appendGithubEnv('CSC_IDENTITY_AUTO_DISCOVERY', 'false');
+  appendGithubEnv('MAC_SIGNING_MODE', 'unsigned');
 }
 
 function main() {
@@ -86,6 +87,8 @@ function main() {
     warn('Missing macOS signing certificate secrets. Falling back to unsigned/ad-hoc macOS packaging.');
     return;
   }
+
+  appendGithubEnv('MAC_SIGNING_MODE', 'signed');
 
   if (!hasNotarizationAuth()) {
     if (hasAnyNotarizationSecret()) {
