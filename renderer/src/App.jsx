@@ -177,10 +177,12 @@ const SOURCE_LABELS = {
 };
 
 const AI_REASONING_OPTIONS = [
+  { value: 'xhigh', label: 'xhigh' },
   { value: 'high', label: 'high' },
   { value: 'medium', label: 'medium' },
   { value: 'low', label: 'low' },
-  { value: 'minimal', label: 'minimal' }
+  { value: 'minimal', label: 'minimal' },
+  { value: 'none', label: 'none' }
 ];
 
 const DEFAULT_AI_CONFIG = {
@@ -199,6 +201,64 @@ const DEFAULT_AI_CONFIG = {
 
 const AI_CHAT_STORAGE_KEY = 'ohmypaper-ai-chat-histories-v1';
 const LEGACY_AI_CHAT_STORAGE_KEYS = ['deepxiv-ai-chat-histories-v1'];
+const THEME_STORAGE_KEY = 'ohmypaper-theme-v1';
+const THEME_OPTIONS = [
+  { value: 'original', label: '原始蓝紫', note: 'OhMyPaper 默认清爽配色', colors: ['#2563eb', '#7c3aed', '#f4f7fb'] },
+  { value: 'champagne-rose', label: '香槟玫瑰', note: '取自香槟玫瑰、蜜桃与深红棕', colors: ['#E5D6CB', '#D49285', '#62382D'] },
+  { value: 'linen-indigo', label: '雾蓝亚麻', note: '取自亚麻白、雾蓝与靛灰', colors: ['#FBFAFF', '#D0D2DB', '#697188'] },
+  { value: 'sakura-plum', label: '樱影暮紫', note: '取自樱粉、木槿紫与近黑暮色', colors: ['#F0D9E4', '#C1A0AC', '#16131F'] },
+  { value: 'deep-ocean', label: '深海青潮', note: '取自海雾蓝、礁石青与深海墨绿', colors: ['#A9C7CE', '#3A747D', '#051D25'] },
+];
+const AI_FALLBACK_REASONING_START = '正在读取论文上下文…';
+const AI_FALLBACK_REASONING_ANSWER = '正在生成回答…';
+const AI_FALLBACK_REASONING_DONE = '已完成论文上下文分析。';
+const AI_PANEL_DEFAULT_WIDTH = 430;
+const AI_PANEL_MIN_WIDTH = 320;
+const AI_PANEL_MAX_WIDTH = 760;
+const AI_PANEL_DETAIL_MIN_WIDTH = 420;
+
+function createAiRequestId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `ai-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function isFallbackReasoningText(text) {
+  const normalized = String(text || '').trim();
+  return normalized === AI_FALLBACK_REASONING_START
+    || normalized === AI_FALLBACK_REASONING_ANSWER
+    || normalized === AI_FALLBACK_REASONING_DONE
+    || normalized === `${AI_FALLBACK_REASONING_START}\n${AI_FALLBACK_REASONING_ANSWER}`;
+}
+
+function clampAiPanelWidth(value, maxWidth = AI_PANEL_MAX_WIDTH) {
+  const numeric = Number(value || AI_PANEL_DEFAULT_WIDTH);
+  const upperBound = Math.max(AI_PANEL_MIN_WIDTH, Math.min(AI_PANEL_MAX_WIDTH, Number(maxWidth || AI_PANEL_MAX_WIDTH)));
+  return Math.round(Math.min(Math.max(numeric, AI_PANEL_MIN_WIDTH), upperBound));
+}
+
+function normalizeTheme(value) {
+  const normalized = String(value || '').trim();
+  return THEME_OPTIONS.some((item) => item.value === normalized) ? normalized : 'original';
+}
+
+function loadTheme() {
+  if (typeof window === 'undefined' || !window.localStorage) return 'original';
+  try {
+    return normalizeTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
+  } catch (error) {
+    return 'original';
+  }
+}
+
+function saveTheme(theme) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(THEME_STORAGE_KEY, normalizeTheme(theme));
+  } catch (error) {
+  }
+}
 
 function defaultAiConfigStatus(aiConfig = normalizeAiConfig()) {
   if (aiConfig.provider.requiresOpenAIAuth && !aiConfig.openAIApiKey) {
@@ -358,10 +418,10 @@ function normalizeAiConversationMessages(messages) {
   return messages
     .map((message, index) => ({
       role: message?.role === 'assistant' ? 'assistant' : 'user',
-      content: String(message?.content || '').trim(),
+      content: String(message?.content || ''),
       isError: message?.isError === true,
       thinkingState: message?.thinkingState === 'done' ? 'done' : (message?.thinkingState === 'thinking' ? 'thinking' : ''),
-      reasoningSummary: String(message?.reasoningSummary || '').trim(),
+      reasoningSummary: String(message?.reasoningSummary || ''),
       reasoningSteps: Array.isArray(message?.reasoningSteps)
         ? message.reasoningSteps
             .map((step, stepIndex) => ({
@@ -371,7 +431,7 @@ function normalizeAiConversationMessages(messages) {
             .filter((step) => step.text)
         : [],
     }))
-    .filter((message) => message.content)
+    .filter((message) => message.content.trim() || message.thinkingState || message.reasoningSummary.trim() || message.reasoningSteps.length)
     .slice(-40);
 }
 
@@ -995,6 +1055,9 @@ function HistoryList({ items, activeKey, onSelect, emptyText }) {
 function AIChatPanel({ snapshot, paper, pdfStatus, pdfViewerState, embeddedPdf, aiConfig, aiConfigStatus, onAskAI, messages = [], onMessagesChange }) {
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(false);
+  const [expandedReasoning, setExpandedReasoning] = useState({});
+  const messagesRef = useRef(messages);
+  const messagesEndRef = useRef(null);
   const snapshotKey = snapshot?.arxiv_id || snapshot?.openalex_id || snapshot?.europepmc_id || paper?.paper_key || paper?.title || '';
   const pdfAttachment = useMemo(
     () => resolveAiPdfAttachment(snapshot, paper, pdfStatus, pdfViewerState, embeddedPdf),
@@ -1028,23 +1091,93 @@ function AIChatPanel({ snapshot, paper, pdfStatus, pdfViewerState, embeddedPdf, 
   useEffect(() => {
     setDraft('');
     setLoading(false);
+    setExpandedReasoning({});
+    messagesRef.current = messages;
   }, [snapshotKey]);
+
+  useEffect(() => {
+    if (!loading) {
+      messagesRef.current = messages;
+    }
+  }, [messages, loading]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [messages, loading]);
 
   async function handleSend() {
     const prompt = draft.trim();
     if (!prompt || loading || !snapshot) return;
-    const history = messages.map((item) => ({ role: item.role, content: item.content }));
-    const nextUserMessages = [...messages, { role: 'user', content: prompt }];
-    onMessagesChange?.(nextUserMessages);
-    setDraft('');
+    const requestId = createAiRequestId();
+    const baseMessages = messagesRef.current || messages;
+    const history = baseMessages
+      .filter((item) => item.role === 'user' || (item.role === 'assistant' && !item.isError && item.content.trim()))
+      .map((item) => ({ role: item.role, content: item.content }));
+    const nextUserMessages = [...baseMessages, { role: 'user', content: prompt }];
+    const assistantIndex = nextUserMessages.length;
+    const publishMessages = (nextMessages) => {
+      messagesRef.current = nextMessages;
+      onMessagesChange?.(nextMessages);
+    };
+    const updateAssistantMessage = (updater) => {
+      const current = [...(messagesRef.current || [])];
+      let targetIndex = assistantIndex;
+      if (!current[targetIndex] || current[targetIndex].role !== 'assistant') {
+        for (let index = current.length - 1; index >= 0; index -= 1) {
+          if (current[index]?.role === 'assistant') {
+            targetIndex = index;
+            break;
+          }
+        }
+      }
+      const currentAssistant = current[targetIndex]?.role === 'assistant'
+        ? current[targetIndex]
+        : { role: 'assistant', content: '', thinkingState: 'thinking', reasoningSummary: '', reasoningSteps: [] };
+      current[targetIndex] = updater(currentAssistant);
+      publishMessages(current);
+    };
+    const unsubscribeStream = window.ohMyPaper.onAiChatStream?.((event) => {
+      if (!event || event.requestId !== requestId) return;
+      if (event.type === 'reasoning_delta' && event.delta) {
+        updateAssistantMessage((current) => ({
+          ...current,
+          thinkingState: 'thinking',
+          reasoningSummary: isFallbackReasoningText(current.reasoningSummary)
+            ? event.delta
+            : `${current.reasoningSummary || ''}${event.delta}`,
+        }));
+      }
+      if (event.type === 'answer_delta' && event.delta) {
+        updateAssistantMessage((current) => ({
+          ...current,
+          thinkingState: current.thinkingState || 'thinking',
+          reasoningSummary: current.reasoningSummary === AI_FALLBACK_REASONING_START
+            ? `${AI_FALLBACK_REASONING_START}\n${AI_FALLBACK_REASONING_ANSWER}`
+            : current.reasoningSummary,
+          content: `${current.content || ''}${event.delta}`,
+        }));
+      }
+      if (event.type === 'error' && event.message) {
+        updateAssistantMessage((current) => ({
+          ...current,
+          isError: true,
+          thinkingState: '',
+          content: event.message,
+        }));
+      }
+    });
     setLoading(true);
+    publishMessages([...nextUserMessages, { role: 'assistant', content: '', thinkingState: 'thinking', reasoningSummary: AI_FALLBACK_REASONING_START, reasoningSteps: [] }]);
+    setDraft('');
     try {
-      const result = await onAskAI({ paperContext: effectivePaperContext, messages: history, prompt });
-      onMessagesChange?.([...nextUserMessages, {
+      const result = await onAskAI({ paperContext: effectivePaperContext, messages: history, prompt, requestId });
+      updateAssistantMessage((current) => ({
+        ...current,
         role: 'assistant',
-        content: result.answer,
+        content: String(result.answer || current.content || ''),
+        isError: false,
         thinkingState: 'done',
-        reasoningSummary: String(result.reasoningSummary || '').trim(),
+        reasoningSummary: String(result.reasoningSummary || (isFallbackReasoningText(current.reasoningSummary) ? AI_FALLBACK_REASONING_DONE : current.reasoningSummary) || ''),
         reasoningSteps: Array.isArray(result.reasoningSteps)
           ? result.reasoningSteps
               .map((item, index) => ({
@@ -1052,11 +1185,12 @@ function AIChatPanel({ snapshot, paper, pdfStatus, pdfViewerState, embeddedPdf, 
                 text: String(item?.text || '').trim(),
               }))
               .filter((item) => item.text)
-          : [],
-      }]);
+          : (current.reasoningSteps || []),
+      }));
     } catch (error) {
-      onMessagesChange?.([...nextUserMessages, { role: 'assistant', content: toUserErrorMessage(error, 'AI 请求失败'), isError: true }]);
+      updateAssistantMessage(() => ({ role: 'assistant', content: toUserErrorMessage(error, 'AI 请求失败'), isError: true }));
     } finally {
+      unsubscribeStream?.();
       setLoading(false);
     }
   }
@@ -1083,44 +1217,54 @@ function AIChatPanel({ snapshot, paper, pdfStatus, pdfViewerState, embeddedPdf, 
           </div>
         )}
         {messages.map((message, index) => (
-          <div key={`${message.role}-${index}`} className={`ai-bubble ${message.role} ${message.isError ? 'error' : ''}`}>
-            <div className="ai-bubble-role">{message.role === 'assistant' ? 'AI' : '你'}</div>
-            {message.role === 'assistant' && !message.isError && (
-              <div className={`ai-thinking-status ${message.thinkingState === 'done' ? 'done' : 'thinking'}`}>
-                {message.thinkingState === 'done' ? '思考完毕' : '思考中'}
-              </div>
-            )}
-            <MarkdownText text={message.content} className="ai-bubble-text markdown-light" />
-            {message.role === 'assistant' && !message.isError && (message.reasoningSteps?.length || message.reasoningSummary || message.thinkingState === 'done') && (
-              <div className="ai-reasoning-block">
-                <div className="ai-reasoning-label">{message.reasoningSteps?.length ? '思考过程' : '思考结果'}</div>
-                {message.reasoningSteps?.length > 0 && (
-                  <div className="ai-reasoning-steps">
-                    {message.reasoningSteps.map((step, stepIndex) => (
-                      <div key={step.id || `reasoning-step-${stepIndex + 1}`} className="ai-reasoning-step">
-                        <span className="ai-reasoning-step-index">{stepIndex + 1}</span>
-                        <MarkdownText text={step.text} className="ai-reasoning-step-text markdown-light" />
-                      </div>
-                    ))}
+          (() => {
+            const reasoningKey = `${message.role}-${index}`;
+            const hasReasoning = message.role === 'assistant' && !message.isError && Boolean(message.reasoningSteps?.length || message.reasoningSummary);
+            const reasoningOpen = expandedReasoning[reasoningKey] ?? message.thinkingState === 'thinking';
+            return (
+              <div key={reasoningKey} className={`ai-bubble ${message.role} ${message.isError ? 'error' : ''}`}>
+                <div className="ai-bubble-role">{message.role === 'assistant' ? 'AI' : '你'}</div>
+                {message.role === 'assistant' && !message.isError && (
+                  <div className={`ai-thinking-status ${message.thinkingState === 'done' ? 'done' : 'thinking'}`}>
+                    {message.thinkingState === 'done' ? '思考完毕' : '思考中'}
                   </div>
                 )}
-                {message.reasoningSummary && (
-                  <MarkdownText text={message.reasoningSummary} className="ai-reasoning-text markdown-light" />
-                )}
-                {!message.reasoningSteps?.length && !message.reasoningSummary && (
-                  <div className="ai-reasoning-text">本次响应未返回可展示的详细思考过程。</div>
+                <MarkdownText text={message.content || (message.role === 'assistant' && message.thinkingState === 'thinking' ? '正在生成回答…' : '')} className="ai-bubble-text markdown-light" />
+                {hasReasoning && (
+                  <div className="ai-reasoning-block">
+                    <button
+                      type="button"
+                      className="ai-reasoning-toggle"
+                      aria-expanded={reasoningOpen}
+                      onClick={() => setExpandedReasoning((prev) => ({ ...prev, [reasoningKey]: !reasoningOpen }))}
+                    >
+                      <span className="ai-reasoning-label">思考过程</span>
+                      <span className="ai-reasoning-toggle-state">{reasoningOpen ? '收起' : '展开'}</span>
+                    </button>
+                    {reasoningOpen && (
+                      <div className="ai-reasoning-content">
+                        {message.reasoningSteps?.length > 0 && (
+                          <div className="ai-reasoning-steps">
+                            {message.reasoningSteps.map((step, stepIndex) => (
+                              <div key={step.id || `reasoning-step-${stepIndex + 1}`} className="ai-reasoning-step">
+                                <span className="ai-reasoning-step-index">{stepIndex + 1}</span>
+                                <MarkdownText text={step.text} className="ai-reasoning-step-text markdown-light" />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {message.reasoningSummary && (
+                          <MarkdownText text={message.reasoningSummary} className="ai-reasoning-text markdown-light" />
+                        )}
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
-            )}
-          </div>
+            );
+          })()
         ))}
-        {loading && (
-          <div className="ai-bubble assistant thinking">
-            <div className="ai-bubble-role">AI</div>
-            <div className="ai-thinking-status thinking">思考中</div>
-            <div className="ai-bubble-text">正在结合论文上下文思考…</div>
-          </div>
-        )}
+        <div ref={messagesEndRef} />
       </div>
       <div className="ai-chat-footer">
         <textarea
@@ -1370,6 +1514,7 @@ export default function App() {
   const [onboardingMessage, setOnboardingMessage] = useState('正在准备 OhMyPaper…');
   const [showOnboardingAiForm, setShowOnboardingAiForm] = useState(false);
   const [isSavingAiConfig, setIsSavingAiConfig] = useState(false);
+  const [theme, setTheme] = useState(() => loadTheme());
   const [token, setToken] = useState(null);
   const [favorites, setFavorites] = useState([]);
   const [favoriteGroups, setFavoriteGroups] = useState([]);
@@ -1388,6 +1533,11 @@ export default function App() {
   const [activePaper, setActivePaper] = useState({ search: null, library: null, history: null });
   const [snapshots, setSnapshots] = useState({ search: null, library: null, history: null });
   const [embeddedPdf, setEmbeddedPdf] = useState({ search: null, library: null, history: null });
+  const [aiPanelWidths, setAiPanelWidths] = useState({
+    search: AI_PANEL_DEFAULT_WIDTH,
+    library: AI_PANEL_DEFAULT_WIDTH,
+    history: AI_PANEL_DEFAULT_WIDTH,
+  });
   const [activeHistoryKey, setActiveHistoryKey] = useState('');
   const [tokenInput, setTokenInput] = useState('');
   const [aiConfig, setAiConfig] = useState(normalizeAiConfig());
@@ -1564,6 +1714,12 @@ export default function App() {
   useEffect(() => {
     saveAiChatStore(aiChatStore);
   }, [aiChatStore]);
+
+  useEffect(() => {
+    const normalizedTheme = normalizeTheme(theme);
+    document.documentElement.dataset.theme = normalizedTheme;
+    saveTheme(normalizedTheme);
+  }, [theme]);
 
   function getAiConversationMessages(snapshot, paper) {
     const key = getAiConversationKey(snapshot, paper);
@@ -2133,6 +2289,99 @@ export default function App() {
   function isLatestContextRequest(ref, context, requestId) {
     return ref.current[context] === requestId;
   }
+
+  function aiPanelLayoutStyle(context) {
+    if (!embeddedPdf[context]?.target) {
+      return undefined;
+    }
+    return {
+      '--ai-panel-width': `${clampAiPanelWidth(aiPanelWidths[context])}px`,
+      '--ai-panel-min-width': `${AI_PANEL_MIN_WIDTH}px`,
+    };
+  }
+
+  function resizeAiPanelTo(context, nextWidth, maxWidth = AI_PANEL_MAX_WIDTH) {
+    setAiPanelWidths((prev) => ({
+      ...prev,
+      [context]: clampAiPanelWidth(nextWidth, maxWidth),
+    }));
+  }
+
+  function handleAiPanelResizeStart(context, event) {
+    if (!embeddedPdf[context]?.target) return;
+    if (event.button != null && event.button !== 0) return;
+
+    const layout = event.currentTarget.closest('.split-layout');
+    const rect = layout?.getBoundingClientRect();
+    if (!rect) return;
+
+    const maxWidth = Math.max(
+      AI_PANEL_MIN_WIDTH,
+      Math.min(AI_PANEL_MAX_WIDTH, rect.width - AI_PANEL_DETAIL_MIN_WIDTH),
+    );
+    const updateWidth = (clientX) => resizeAiPanelTo(context, clientX - rect.left, maxWidth);
+    const cleanup = () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', cleanup);
+      window.removeEventListener('pointercancel', cleanup);
+      document.documentElement.classList.remove('is-ai-panel-resizing');
+    };
+    const handlePointerMove = (moveEvent) => {
+      moveEvent.preventDefault();
+      updateWidth(moveEvent.clientX);
+    };
+
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    document.documentElement.classList.add('is-ai-panel-resizing');
+    updateWidth(event.clientX);
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', cleanup, { once: true });
+    window.addEventListener('pointercancel', cleanup, { once: true });
+  }
+
+  function handleAiPanelResizeKeyDown(context, event) {
+    if (!embeddedPdf[context]?.target) return;
+    const step = event.shiftKey ? 48 : 24;
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      resizeAiPanelTo(context, (aiPanelWidths[context] || AI_PANEL_DEFAULT_WIDTH) - step);
+    }
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      resizeAiPanelTo(context, (aiPanelWidths[context] || AI_PANEL_DEFAULT_WIDTH) + step);
+    }
+    if (event.key === 'Home') {
+      event.preventDefault();
+      resizeAiPanelTo(context, AI_PANEL_MIN_WIDTH);
+    }
+    if (event.key === 'End') {
+      event.preventDefault();
+      resizeAiPanelTo(context, AI_PANEL_MAX_WIDTH);
+    }
+  }
+
+  function renderAiPanelResizeHandle(context) {
+    if (!embeddedPdf[context]?.target) {
+      return null;
+    }
+    return (
+      <div
+        className="ai-panel-resize-handle"
+        role="separator"
+        aria-label="调整 AI 助手宽度"
+        aria-orientation="vertical"
+        tabIndex={0}
+        title="拖动调整 AI 助手宽度，双击恢复默认"
+        onPointerDown={(event) => handleAiPanelResizeStart(context, event)}
+        onKeyDown={(event) => handleAiPanelResizeKeyDown(context, event)}
+        onDoubleClick={() => resizeAiPanelTo(context, AI_PANEL_DEFAULT_WIDTH)}
+      >
+        <span />
+      </div>
+    );
+  }
+
   const liveStatusText = statusText || (
     page === 'search'
       ? `${selectedSearchSource.label} · ${showSearchLimit ? `最多 ${searchLimit} 条结果` : '直接打开目标'}`
@@ -2294,7 +2543,7 @@ export default function App() {
               <button className="btn primary" onClick={handleSearch}>{searchActionLabel}</button>
             </div>
             <div className="mode-hint">{selectedSearchSource.label}：{selectedSearchSource.help}</div>
-            <div className="split-layout">
+            <div className={`split-layout ${embeddedPdf.search?.target ? 'ai-resizable-layout' : ''}`} style={aiPanelLayoutStyle('search')}>
               <div className={`card list-panel ${embeddedPdf.search?.target ? 'ai-list-panel' : ''}`}>
                 {embeddedPdf.search?.target ? renderContextAiPanel('search', '请选择一篇论文。') : (
                   <ResultList
@@ -2306,6 +2555,7 @@ export default function App() {
                     emptyText="暂无结果"
                   />
                 )}
+                {renderAiPanelResizeHandle('search')}
               </div>
               <div className="card detail-panel">
                 <DetailView
@@ -2335,7 +2585,7 @@ export default function App() {
 
         {page === 'library' && (
           <section className="page active">
-            <div className="split-layout">
+            <div className={`split-layout ${embeddedPdf.library?.target ? 'ai-resizable-layout' : ''}`} style={aiPanelLayoutStyle('library')}>
               <div className={`card list-panel ${embeddedPdf.library?.target ? 'ai-list-panel' : ''}`}>
                 {embeddedPdf.library?.target ? renderContextAiPanel('library', '请选择一篇收藏论文。') : (
                   <div className="favorites-shell">
@@ -2434,6 +2684,7 @@ export default function App() {
                     ) : <EmptyState text={favorites.length ? '当前分组暂无论文。' : '暂无收藏，可先导入本地 PDF 或收藏搜索结果。'} />}
                   </div>
                 )}
+                {renderAiPanelResizeHandle('library')}
               </div>
 
               <div className="card detail-panel">
@@ -2464,11 +2715,12 @@ export default function App() {
 
         {page === 'history' && (
           <section className="page active">
-            <div className="split-layout">
+            <div className={`split-layout ${embeddedPdf.history?.target ? 'ai-resizable-layout' : ''}`} style={aiPanelLayoutStyle('history')}>
               <div className={`card list-panel ${embeddedPdf.history?.target ? 'ai-list-panel' : ''}`}>
                 {embeddedPdf.history?.target ? renderContextAiPanel('history', '请选择一篇最近访问的论文。') : (
                   <HistoryList items={history} activeKey={activeHistoryKey} onSelect={handleOpenHistory} emptyText="暂无记录" />
                 )}
+                {renderAiPanelResizeHandle('history')}
               </div>
               <div className="card detail-panel">
                 <DetailView
@@ -2577,6 +2829,35 @@ export default function App() {
                 <div className="btn-row">
                   <button className="btn primary" onClick={handleSaveAiConfig}>保存 AI 配置</button>
                   <button className="btn" onClick={handleResetAiConfig}>恢复默认</button>
+                </div>
+              </div>
+
+              <div className="card settings-card">
+                <h3>主题配色</h3>
+                <div className="settings-status-row">
+                  <div className="settings-status-copy">
+                    <div className="settings-status-label">当前主题</div>
+                    <div className="settings-status-hint">{THEME_OPTIONS.find((item) => item.value === theme)?.label || '原始蓝紫'}</div>
+                  </div>
+                </div>
+                <div className="theme-options">
+                  {THEME_OPTIONS.map((item) => (
+                    <button
+                      key={item.value}
+                      type="button"
+                      className={`theme-option ${theme === item.value ? 'active' : ''}`}
+                      aria-pressed={theme === item.value}
+                      onClick={() => setTheme(item.value)}
+                    >
+                      <span className="theme-swatch" aria-hidden="true">
+                        {item.colors.map((color) => <span key={color} style={{ background: color }} />)}
+                      </span>
+                      <span className="theme-option-copy">
+                        <span className="theme-option-title">{item.label}</span>
+                        <span className="theme-option-note">{item.note}</span>
+                      </span>
+                    </button>
+                  ))}
                 </div>
               </div>
 

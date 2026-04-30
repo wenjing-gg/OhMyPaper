@@ -107,13 +107,24 @@ async function run() {
         requiresOpenAIAuth: true,
       },
     };
+    const streamEvents = [];
     const sseResult = await postResponsesRequest(aiConfigSse, {
       model: 'gpt-5.4',
       input: [{ role: 'user', content: [{ type: 'input_text', text: 'ping' }] }],
-    }, 5000);
+    }, 5000, {
+      onEvent: (event) => streamEvents.push(event),
+    });
     assert.equal(sseResult.response.ok, true);
     assert.equal(sseResult.data.output_text, 'Hello Windows');
     assert.equal(sseResult.data.reasoning_text, 'thinking');
+    assert.deepEqual(
+      streamEvents.filter((event) => event.type === 'answer_delta').map((event) => event.delta),
+      ['Hello ', 'Windows'],
+    );
+    assert.deepEqual(
+      streamEvents.filter((event) => event.type === 'reasoning_delta').map((event) => event.delta),
+      ['thinking'],
+    );
 
     const pdfResponse = await fetchWithAppSession(`${baseUrl}/paper.pdf`, {
       method: 'GET',

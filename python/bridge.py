@@ -18,7 +18,7 @@ from xml.etree import ElementTree
 
 import requests
 from dotenv import load_dotenv
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 from deepxiv_sdk import Reader
 from deepxiv_sdk.cli import DEFAULT_DAILY_LIMIT, SDK_REGISTER_ENDPOINT, ensure_token, generate_registration_payload, get_token, save_token
@@ -906,6 +906,86 @@ def extract_pdf_context_excerpt(full_text: str, abstract: str) -> str:
     if abstract and abstract in cleaned:
         return cleaned[:5000]
     return cleaned[:5000]
+
+
+def extract_pdf_text_for_ai(payload: Dict[str, Any]) -> Dict[str, Any]:
+    file_path = Path(str(payload.get("path") or "")).expanduser().resolve()
+    if not file_path.exists():
+        raise FileNotFoundError("未找到本地 PDF 文件")
+    if file_path.suffix.lower() != ".pdf":
+        raise ValueError("请选择 PDF 文件")
+
+    try:
+        max_chars = int(payload.get("max_chars") or 120000)
+    except Exception:
+        max_chars = 120000
+    max_chars = max(1000, min(max_chars, 240000))
+
+    reader = PdfReader(str(file_path))
+    parts: List[str] = []
+    total_chars = 0
+    truncated = False
+    for index, page in enumerate(reader.pages):
+        try:
+            page_text = normalize_spaces(page.extract_text() or "")
+        except Exception:
+            continue
+        if not page_text:
+            continue
+        page_block = f"第 {index + 1} 页：{page_text}"
+        remaining = max_chars - total_chars
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(page_block) > remaining:
+            parts.append(page_block[:remaining])
+            total_chars += remaining
+            truncated = True
+            break
+        parts.append(page_block)
+        total_chars += len(page_block)
+
+    text = "\n\n".join(parts).strip()
+    return {
+        "text": text,
+        "chars": len(text),
+        "pageCount": len(reader.pages),
+        "truncated": truncated or bool(text and len(text) >= max_chars),
+    }
+
+
+def compress_pdf_for_ai(payload: Dict[str, Any]) -> Dict[str, Any]:
+    file_path = Path(str(payload.get("path") or "")).expanduser().resolve()
+    output_path = Path(str(payload.get("output_path") or "")).expanduser().resolve()
+    if not file_path.exists():
+        raise FileNotFoundError("未找到本地 PDF 文件")
+    if file_path.suffix.lower() != ".pdf":
+        raise ValueError("请选择 PDF 文件")
+    if not output_path:
+        raise ValueError("缺少输出路径")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    reader = PdfReader(str(file_path))
+    writer = PdfWriter()
+    for page in reader.pages:
+        try:
+            page.compress_content_streams()
+        except Exception:
+            pass
+        writer.add_page(page)
+    try:
+        writer.add_metadata({})
+    except Exception:
+        pass
+    with output_path.open("wb") as handle:
+        writer.write(handle)
+
+    return {
+        "path": str(output_path),
+        "originalSize": file_path.stat().st_size,
+        "compressedSize": output_path.stat().st_size,
+        "pageCount": len(reader.pages),
+    }
 
 
 def parse_local_pdf(file_path_value: str) -> Dict[str, Any]:
@@ -1882,6 +1962,8 @@ COMMANDS = {
     "trending": cmd_trending,
     "snapshot": cmd_snapshot,
     "import-local-pdf": lambda payload: parse_local_pdf(str(payload.get("path") or "")),
+    "extract-pdf-text": extract_pdf_text_for_ai,
+    "compress-pdf": compress_pdf_for_ai,
     "section": cmd_section,
     "cache-pmc-pdf": cmd_cache_pmc_pdf,
     "validate-pdf-file": cmd_validate_pdf_file,

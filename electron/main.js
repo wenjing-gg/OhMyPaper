@@ -22,7 +22,9 @@ const DEFAULT_AI_CONFIG = {
   },
 };
 
-const AI_REASONING_LEVELS = new Set(['high', 'medium', 'low', 'minimal']);
+const AI_REASONING_LEVELS = new Set(['xhigh', 'high', 'medium', 'low', 'minimal', 'none']);
+const AI_INLINE_PDF_MAX_BYTES = 8 * 1024 * 1024;
+const AI_PDF_TEXT_CONTEXT_MAX_CHARS = 120000;
 const LEGACY_APP_DATA_NAMES = ['DeepXiv Client', 'deepxiv-client'];
 let mainWindow = null;
 const pdfViewerWindows = new Set();
@@ -913,14 +915,51 @@ async function buildAiInputFileAttachment(paperContext = {}) {
 
   try {
     const filePath = descriptor.localPath || await cacheRemotePdfForAi(descriptor.sourceUrl);
-    const buffer = await fsp.readFile(filePath);
+    let attachPath = filePath;
+    let stats = await fsp.stat(attachPath);
+    if (stats.size > AI_INLINE_PDF_MAX_BYTES) {
+      const compressedPath = await compressPdfForAi(filePath).catch(() => '');
+      if (compressedPath) {
+        const compressedStats = await fsp.stat(compressedPath);
+        if (compressedStats.size > 0 && compressedStats.size < stats.size && compressedStats.size <= AI_INLINE_PDF_MAX_BYTES) {
+          attachPath = compressedPath;
+          stats = compressedStats;
+        }
+      }
+    }
+
+    if (stats.size > AI_INLINE_PDF_MAX_BYTES) {
+      const extracted = await extractPdfTextForAi(attachPath, AI_PDF_TEXT_CONTEXT_MAX_CHARS);
+      const text = String(extracted?.text || '').trim();
+      if (!text) {
+        throw new Error('PDF 文件超过 AI 服务直传上限，且未能提取到可用正文');
+      }
+      return {
+        inputFile: null,
+        inputText: {
+          type: 'input_text',
+          text: [
+            `PDF 原文过大（${formatFileSize(stats.size)}），已自动改用 PDF 正文文本上下文。`,
+            extracted.pageCount ? `页数：${extracted.pageCount}` : '',
+            extracted.truncated ? `已截取前 ${extracted.chars || text.length} 个字符。` : '',
+            text,
+          ].filter(Boolean).join('\n\n'),
+        },
+        attachMode: 'text_extract',
+        localPath: filePath,
+        aiAttachmentMessage: 'PDF 原文过大，已自动改用 PDF 正文文本上下文',
+      };
+    }
+
+    const buffer = await fsp.readFile(attachPath);
     return {
       inputFile: {
         type: 'input_file',
-        filename: path.basename(filePath) || 'paper.pdf',
+        filename: path.basename(attachPath) || 'paper.pdf',
         file_data: `data:application/pdf;base64,${buffer.toString('base64')}`,
       },
       attachMode: 'file_data',
+      localPath: attachPath,
     };
   } catch (error) {
     return {
@@ -929,6 +968,45 @@ async function buildAiInputFileAttachment(paperContext = {}) {
       aiAttachmentMessage: String(error?.message || error || 'PDF 读取失败，当前未附带原文').trim() || 'PDF 读取失败，当前未附带原文',
     };
   }
+}
+
+function formatFileSize(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return '未知大小';
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)}MB`;
+  if (value >= 1024) return `${Math.round(value / 1024)}KB`;
+  return `${value}B`;
+}
+
+async function extractPdfTextForAi(filePath, maxChars = AI_PDF_TEXT_CONTEXT_MAX_CHARS) {
+  return callBridge('extract-pdf-text', {
+    path: filePath,
+    max_chars: maxChars,
+  });
+}
+
+async function compressPdfForAi(filePath) {
+  const sourcePath = String(filePath || '').trim();
+  if (!sourcePath) return '';
+  await fsp.mkdir(pdfCacheDir(), { recursive: true });
+  const outputPath = path.join(pdfCacheDir(), `${sha1(`ai-compressed|${sourcePath}`)}.pdf`);
+  if (await fileExists(outputPath)) {
+    const valid = await validatePdfFilePath(outputPath);
+    if (valid) {
+      return outputPath;
+    }
+    await fsp.rm(outputPath, { force: true }).catch(() => {});
+  }
+  const result = await callBridge('compress-pdf', {
+    path: sourcePath,
+    output_path: outputPath,
+  });
+  const compressedPath = String(result?.path || outputPath).trim();
+  if (!compressedPath || !(await validatePdfFilePath(compressedPath))) {
+    await fsp.rm(outputPath, { force: true }).catch(() => {});
+    return '';
+  }
+  return compressedPath;
 }
 
 async function getCachedPdfStatus(normalized) {
@@ -2851,7 +2929,7 @@ function toResponseInputMessage(message) {
   if (!text) return null;
   return {
     role,
-    content: [{ type: 'input_text', text }],
+    content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }],
   };
 }
 
@@ -3084,6 +3162,12 @@ function formatAiConnectivityError(baseUrl, error) {
   }
   if (causeCode === 'EHOSTUNREACH' || causeCode === 'ENETUNREACH' || causeCode === 'ERR_INTERNET_DISCONNECTED') {
     return `当前网络不可用，无法连接 AI 服务：${host}`;
+  }
+  if (/error code:\s*502|bad gateway|\bHTTP\s*502\b|\b502\b/i.test(rawMessage)) {
+    return 'AI 上游服务暂时不可用（HTTP 502）。如果正在附带较大的 PDF，通常是服务网关无法处理过大的文件请求';
+  }
+  if (/maximum size|request entity too large|payload too large|body too large|\bHTTP\s*413\b|\b413\b/i.test(rawMessage)) {
+    return 'PDF 原文过大，超过当前 AI 服务请求上限';
   }
   if (rawMessage === 'fetch failed' && host) {
     return `无法连接到 AI 服务：${host}`;
@@ -3407,12 +3491,12 @@ async function probeAiConfig(rawConfig = {}) {
     const { response, data } = await postResponsesRequest(aiConfig, {
         model: aiConfig.model,
         store: false,
-        reasoning: { effort: 'minimal' },
+        reasoning: { effort: probeReasoningEffort(aiConfig.model) },
         instructions: 'Reply with OK only.',
         input: [{ role: 'user', content: [{ type: 'input_text', text: 'ping' }] }],
       }, 20000);
     if (!response.ok) {
-      const message = data?.error?.message || data?.message || data?.rawText || `AI 请求失败（HTTP ${response.status}）`;
+      const message = formatAiHttpError(response.status, data);
       return normalizeAiConfigStatus({
         ok: false,
         code: `http_${response.status}`,
@@ -3444,6 +3528,52 @@ async function probeAiConfig(rawConfig = {}) {
   }
 }
 
+function probeReasoningEffort(model = '') {
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  if (normalizedModel.includes('5.4')) {
+    return 'low';
+  }
+  return 'low';
+}
+
+function runtimeReasoningEffort(aiConfig = {}) {
+  const effort = String(aiConfig.modelReasoningEffort || DEFAULT_AI_CONFIG.modelReasoningEffort).trim().toLowerCase();
+  const model = String(aiConfig.model || '').trim().toLowerCase();
+  if (effort === 'minimal' && model.includes('5.4')) {
+    return 'low';
+  }
+  return AI_REASONING_LEVELS.has(effort) ? effort : DEFAULT_AI_CONFIG.modelReasoningEffort;
+}
+
+function runtimeReasoningOptions(aiConfig = {}) {
+  const effort = runtimeReasoningEffort(aiConfig);
+  if (effort === 'none') {
+    return {};
+  }
+  return {
+    effort,
+    summary: 'auto',
+  };
+}
+
+function formatAiHttpError(status, data = {}) {
+  const statusCode = Number(status || 0);
+  const rawMessage = String(data?.error?.message || data?.message || data?.rawText || '').trim();
+  if (statusCode === 413 || /maximum size|request entity too large|payload too large|body too large/i.test(rawMessage)) {
+    return 'PDF 原文过大，超过当前 AI 服务请求上限';
+  }
+  if (statusCode === 502 || /bad gateway|error code:\\s*502|\\b502\\b/i.test(rawMessage)) {
+    return 'AI 上游服务暂时不可用（HTTP 502）。如果正在附带较大的 PDF，通常是服务网关无法处理过大的文件请求';
+  }
+  if (statusCode === 429) {
+    return rawMessage || 'AI 服务请求过于频繁，请稍后重试';
+  }
+  if (statusCode >= 500) {
+    return rawMessage || `AI 上游服务暂时不可用（HTTP ${statusCode}）`;
+  }
+  return rawMessage || `AI 请求失败（HTTP ${statusCode || '未知'}）`;
+}
+
 async function refreshStatus() {
   const state = await readState();
   const token = await callBridge('token-status');
@@ -3456,7 +3586,18 @@ async function refreshStatus() {
   };
 }
 
-async function callAi(payload = {}) {
+function sendAiStreamEvent(ipcEvent, requestId, payload = {}) {
+  const id = String(requestId || '').trim();
+  if (!id || !ipcEvent?.sender || ipcEvent.sender.isDestroyed?.()) {
+    return;
+  }
+  ipcEvent.sender.send('ai:chat-stream', {
+    requestId: id,
+    ...payload,
+  });
+}
+
+async function callAi(payload = {}, ipcEvent = null) {
   const state = await readState();
   const aiConfig = normalizeAiConfig(payload.aiConfig || state.aiConfig || {});
   const prompt = String(payload.prompt || '').trim();
@@ -3470,15 +3611,20 @@ async function callAi(payload = {}) {
     throw new Error('请先在设置中配置 OPENAI_API_KEY');
   }
 
+  const streamRequestId = String(payload.requestId || '').trim();
+  const emitStream = (event) => sendAiStreamEvent(ipcEvent, streamRequestId, event);
   const paperContext = payload.paperContext || {};
   const history = Array.isArray(payload.messages) ? payload.messages : [];
   const input = [];
   const hasTextContext = Boolean(String(paperContext.contextText || '').trim());
   const contextContent = [{ type: 'input_text', text: buildPaperContextText(paperContext) }];
   const pdfAttachment = await buildAiInputFileAttachment(paperContext);
-  const hasPdfContext = Boolean(pdfAttachment.inputFile);
+  const hasPdfContext = Boolean(pdfAttachment.inputFile || pdfAttachment.inputText);
   if (pdfAttachment.inputFile) {
     contextContent.push(pdfAttachment.inputFile);
+  }
+  if (pdfAttachment.inputText) {
+    contextContent.push(pdfAttachment.inputText);
   }
   input.push({ role: 'user', content: contextContent });
 
@@ -3491,35 +3637,48 @@ async function callAi(payload = {}) {
   input.push({ role: 'user', content: [{ type: 'input_text', text: prompt }] });
 
   try {
+    emitStream({ type: 'started' });
     const { response, data } = await postResponsesRequest(aiConfig, {
         model: aiConfig.model,
         store: !aiConfig.disableResponseStorage,
-        reasoning: { effort: aiConfig.modelReasoningEffort },
+        reasoning: runtimeReasoningOptions(aiConfig),
         instructions: 'You are OhMyPaper 的论文阅读助手。默认使用中文回答，优先依据随附 PDF 内容，其次参考论文元信息。回答应准确、简洁，并在不确定时明确说明。',
         input,
-      }, 120000);
+      }, 120000, {
+        onEvent: (event) => {
+          if (!event || event.type === 'response_text') {
+            return;
+          }
+          emitStream(event);
+        },
+      });
 
     if (!response.ok) {
-      const message = data?.error?.message || data?.message || data?.rawText || `AI 请求失败（HTTP ${response.status}）`;
+      const message = formatAiHttpError(response.status, data);
       throw new Error(message);
     }
 
     const reasoning = extractReasoningArtifacts(data);
 
-    return {
+    const result = {
       answer: extractResponseText(data),
       reasoningSummary: reasoning.summaryText,
       reasoningSteps: reasoning.steps,
       usedPdfContext: Boolean(hasPdfContext || hasTextContext),
-      contextMode: hasPdfContext ? 'pdf' : hasTextContext ? 'text' : 'metadata',
+      contextMode: pdfAttachment.inputFile ? 'pdf' : pdfAttachment.inputText ? 'pdf_text' : hasTextContext ? 'text' : 'metadata',
       providerName: aiConfig.provider.name || aiConfig.modelProvider,
       model: aiConfig.model,
     };
+    emitStream({ type: 'final', ...result });
+    return result;
   } catch (error) {
     if (error?.name === 'AbortError') {
+      emitStream({ type: 'error', message: 'AI 请求超时，请稍后重试' });
       throw new Error('AI 请求超时，请稍后重试');
     }
-    throw new Error(formatAiConnectivityError(aiConfig.provider.baseUrl, error));
+    const message = formatAiConnectivityError(aiConfig.provider.baseUrl, error);
+    emitStream({ type: 'error', message });
+    throw new Error(message);
   }
 }
 
@@ -3757,7 +3916,7 @@ app.whenReady().then(() => {
   ipcMain.handle('history:add', (_, payload) => addHistory(payload.kind, payload.payload));
   ipcMain.handle('ai:config:get', getAiConfig);
   ipcMain.handle('ai:config:save', (_, payload) => saveAiConfig(payload));
-  ipcMain.handle('ai:chat', (_, payload) => callAi(payload));
+  ipcMain.handle('ai:chat', (event, payload) => callAi(payload, event));
   ipcMain.handle('pdf:loadDocument', (_, payload) => loadPdfDocument(payload));
   ipcMain.handle('pdf:openViewer', (_, payload) => openPdfViewer(payload));
   ipcMain.handle('shell:openExternal', (_, url) => shell.openExternal(url));

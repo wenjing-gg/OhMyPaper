@@ -26,6 +26,14 @@ const desktopApi = {
   aiConfig: () => ipcRenderer.invoke('ai:config:get'),
   saveAiConfig: (payload) => ipcRenderer.invoke('ai:config:save', payload),
   aiChat: (payload) => ipcRenderer.invoke('ai:chat', payload),
+  onAiChatStream: (callback) => {
+    if (typeof callback !== 'function') {
+      return () => {};
+    }
+    const listener = (_, payload) => callback(payload);
+    ipcRenderer.on('ai:chat-stream', listener);
+    return () => ipcRenderer.removeListener('ai:chat-stream', listener);
+  },
   openPdfViewer: (payload) => ipcRenderer.invoke('pdf:openViewer', payload),
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
   openPath: (targetPath) => ipcRenderer.invoke('shell:openPath', targetPath),
